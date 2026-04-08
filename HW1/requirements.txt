@@ -1,0 +1,15 @@
+accelerate
+bitsandbytes; platform_system != "Darwin"
+datasets
+matplotlib
+numpy
+pandas
+peft
+scikit-learn
+seaborn
+torch
+tqdm
+transformers
+trl==0.19.1
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+xformers; platform_system != "Darwin" and python_version < "3.13"
