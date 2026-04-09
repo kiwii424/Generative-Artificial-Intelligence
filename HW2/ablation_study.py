@@ -1,585 +1,938 @@
 #!/usr/bin/env python3
 """
-Ablation Study: Find optimal chunking parameters for Evidence Score
-Tunes: child_target, child_max, parent_window, parent_max
+Comprehensive hyperparameter tuner for HW2 RAG.
 
-Usage:
-  python ablation_study.py [--sample N] [--seed S] [--output results.csv]
+This script does not modify `111511157.py`.
+Instead, it dynamically loads the main pipeline and overrides score-related
+hyperparameters from the outside, so the submission file stays untouched.
 
-Outputs:
-  - CSV file with all combinations and their scores
-  - JSON file with detailed results
-  - Console summary of top configs
+Features:
+  - Edit parameter ranges directly in this file
+  - Grid search or random search
+  - Evidence-only mode (fast) or full-pipeline mode
+  - Optional official public scoring via `score_public.py`
+
+Examples:
+  uv run python HW2/ablation_study.py
+  uv run python HW2/ablation_study.py --strategy random --max-trials 20
+  uv run python HW2/ablation_study.py --mode full --official-score --optimize official_combined_score
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
+import itertools
 import json
 import logging
+import math
 import os
 import random
 import re
+import statistics
+import subprocess
 import sys
+import tempfile
 import time
-import itertools
-from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-import faiss
-import nltk
-from openai import OpenAI
-from rank_bm25 import BM25Okapi
-from rouge_score import rouge_scorer
-from sentence_transformers import CrossEncoder, SentenceTransformer
 from tqdm import tqdm
 
-from dotenv import load_dotenv
 
-load_dotenv()
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_MAIN_SCRIPT = SCRIPT_DIR / "111511157.py"
+DEFAULT_DATASET = SCRIPT_DIR / "datasets" / "public_dataset.json"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "outputs" / "tuning"
 
-nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
+# Edit ranges here directly.
+# Each value must be a list. Grid search tests all combinations; random search
+# samples from these lists.
+SEARCH_SPACE: dict[str, list[Any]] = {
+    # Models
+    "embed_model": ["BAAI/bge-large-en-v1.5"],
+    "reranker_model": ["BAAI/bge-reranker-v2-m3"],
+    "llm_model": ["meta-llama/llama-3.2-3b-instruct"],  # fixed by course rule
 
-import ssl
-try:
-    _create_unverified_https_context = ssl._create_unverified_context
-except AttributeError:
-    pass
-else:
-    ssl._create_default_https_context = _create_unverified_https_context
+    # Chunking
+    "child_target_chars": [200],
+    "child_max_chars": [400],
+    "parent_window_chunks": [2],
+    "parent_max_chars": [800],
+    "chunk_sentence_overlap": [1],
+    "sentence_merge_min_chars": [60],
+    "force_split_window": [80],
+
+    # Retrieval / fusion / reranking
+    "dense_top_k": [40],
+    "bm25_top_k": [40],
+    "rrf_top_k": [20],
+    "rrf_k": [60],
+    "rerank_pool": [15],
+    "reranker_score_threshold": [0.0],
+    "reranker_gap_threshold": [2.0],
+    "reranker_relative_threshold": [0.3],
+    "section_boost_score": [1.5],
+    "enable_section_routing": [True],
+    "reranker_max_length": [1024],
+    "embed_query_prefix": ["Represent this sentence for searching relevant passages: "],
+
+    # Query expansion / HyDE
+    "enable_stripped_query": [True],
+    "enable_keyword_query": [True],
+    "max_query_variants": [3],
+    "keyword_variant_min_terms": [2],
+    "stripped_query_min_chars": [10],
+    "enable_hyde": [True],
+    "hyde_temperature": [0.3],
+    "hyde_max_tokens": [150],
+
+    # Evidence selection
+    "default_final_k": [2],
+    "list_question_final_k": [3],
+    "max_evidence_for_llm": [5],
+
+    # Generation
+    "llm_temperature": [0.1],
+    "llm_max_tokens": [256],
+}
+
+OPTIMIZE_CHOICES = [
+    "mean_evidence_score",
+    "official_evidence_score",
+    "official_correctness",
+    "official_combined_score",
+]
+
+LLM_ONLY_IN_EVIDENCE_MODE = {
+    "max_evidence_for_llm",
+    "llm_temperature",
+    "llm_max_tokens",
+}
+
+LIST_QUESTION_KEYWORDS = [
+    "list", "what are the", "name the", "how many",
+    "what methods", "what techniques", "what datasets",
+    "what approaches", "what models", "what features",
+    "what types", "what kinds", "what categories",
+]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Ablation Configuration — EDIT HERE to change ranges
-# ═══════════════════════════════════════════════════════════════════════════════
-# 定義各個參數要測試的範圍 (組合數會相乘，請根據電腦效能調整)
-CHILD_TARGETS = [150, 200, 250, 300]     # Ideal chunk size
-CHILD_MAXS = [250, 400]             # Absolute max chunk size
-PARENT_WINDOWS = [1, 2, 3]               # Chunks before + after
-PARENT_MAXS = [600, 800, 1000]           # Max characters for LLM context window
-
-EVAL_SAMPLE_SIZE = 20                    # Use 100 random papers for fast feedback
-SEED = 42
-
-# Fixed parameters (same as main pipeline)
-DENSE_TOP_K = 40
-BM25_TOP_K = 40
-RRF_TOP_K = 20
-RRF_K = 60
-DEFAULT_FINAL_K = 5
-MAX_EVIDENCE_FOR_LLM = 3
-
-EMBED_MODEL = "BAAI/bge-large-en-v1.5"
-RERANKER_MODEL = "BAAI/bge-reranker-base"
-LLM_MODEL = "meta-llama/llama-3.2-3b-instruct"
-LLM_BASE_URL = "https://openrouter.ai/api/v1"
-
-LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 256
-
-_STOP_WORDS = frozenset(
-    "the and for are was were has have had does did can could would should "
-    "this that these those with from into what which how why where when who "
-    "whom whose not been about also more than their they them some other "
-    "will may must shall being used using".split()
-)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Data Classes & Utilities
-# ═══════════════════════════════════════════════════════════════════════════════
-@dataclass
-class Chunk:
-    chunk_id: int
-    text: str
-    parent_text: str
-    sent_start: int
-    sent_end: int
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Tune HW2 hyperparameters by editing SEARCH_SPACE in this file."
+    )
+    parser.add_argument("--main-script", type=str, default=str(DEFAULT_MAIN_SCRIPT),
+                        help="Path to the main submission script (default: HW2/111511157.py)")
+    parser.add_argument("--dataset", type=str, default=str(DEFAULT_DATASET),
+                        help="Dataset JSON with ground-truth evidence/answer (default: public dataset)")
+    parser.add_argument("--mode", choices=["evidence", "full"], default="evidence",
+                        help="evidence=fast retrieval-only scoring, full=run the full pipeline")
+    parser.add_argument("--strategy", choices=["grid", "random"], default="grid",
+                        help="Search strategy")
+    parser.add_argument("--max-trials", type=int, default=20,
+                        help="Maximum trials for random search (default: 20)")
+    parser.add_argument("--sample", type=int, default=20,
+                        help="Randomly sample N papers from dataset (0=all, default: 20)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--optimize", choices=OPTIMIZE_CHOICES, default="mean_evidence_score",
+                        help="Metric to optimize")
+    parser.add_argument("--official-score", action="store_true",
+                        help="In full mode, additionally run score_public.py for official-style evidence/correctness")
+    parser.add_argument("--judge-host", type=str, default="localhost",
+                        help="Host for score_public.py judge server")
+    parser.add_argument("--judge-port", type=int, default=8091,
+                        help="Port for score_public.py judge server")
+    parser.add_argument("--judge-model", type=str, default="meta-llama/Llama-3.2-3B-Instruct",
+                        help="Judge model name for score_public.py")
+    parser.add_argument("--judge-times", type=int, default=5,
+                        help="Judge runs per paper for score_public.py")
+    parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR),
+                        help="Directory for CSV/JSON summaries")
+    parser.add_argument("--keep-trial-files", action="store_true",
+                        help="Keep per-trial prediction and score JSON files")
+    parser.add_argument("--verbose", action="store_true", help="Print more logs to the console")
+    return parser.parse_args()
 
 
-@dataclass
-class QAResult:
-    title: str
-    answer: str
-    evidence: list
+def resolve_dataset_path(dataset_arg: str) -> Path:
+    path = Path(dataset_arg)
+    if path.exists():
+        return path
+    candidate = SCRIPT_DIR / dataset_arg
+    if candidate.exists():
+        return candidate
+    raise FileNotFoundError(f"Dataset not found: {dataset_arg}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DocumentProcessor (Dynamic chunk params)
-# ═══════════════════════════════════════════════════════════════════════════════
-class DocumentProcessor:
-    def __init__(self, child_target: int, child_max: int, parent_window: int, parent_max: int):
-        self.child_target = child_target
-        self.child_max = child_max
-        self.parent_window = parent_window
-        self.parent_max = parent_max
+def load_dataset(path: Path, sample: int, seed: int) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as f:
+        dataset = json.load(f)
 
-    def split_sentences(self, text: str) -> list:
-        raw = nltk.sent_tokenize(text)
-        merged = []
-        buf = ""
-        for s in raw:
-            s = s.strip()
-            if not s:
-                continue
+    if sample > 0 and sample < len(dataset):
+        rng = random.Random(seed)
+        dataset = rng.sample(dataset, sample)
+    return dataset
+
+
+def dump_json(data: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def setup_logger(output_dir: Path, verbose: bool) -> tuple[logging.Logger, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = output_dir / f"tuner_{timestamp}.log"
+
+    logger = logging.getLogger(f"rag_tuner_{timestamp}")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s", "%H:%M:%S"))
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.INFO if verbose else logging.WARNING)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(console_handler)
+
+    return logger, log_path
+
+
+def grid_size(space: dict[str, list[Any]]) -> int:
+    return math.prod(len(values) for values in space.values())
+
+
+def validate_config(config: dict[str, Any]) -> tuple[bool, str]:
+    positive_int_fields = [
+        "child_target_chars", "child_max_chars", "parent_window_chunks", "parent_max_chars",
+        "chunk_sentence_overlap", "sentence_merge_min_chars", "force_split_window",
+        "dense_top_k", "bm25_top_k", "rrf_top_k", "rrf_k", "rerank_pool", "reranker_max_length",
+        "max_query_variants", "keyword_variant_min_terms", "stripped_query_min_chars",
+        "hyde_max_tokens", "default_final_k", "list_question_final_k",
+        "max_evidence_for_llm", "llm_max_tokens",
+    ]
+    for field in positive_int_fields:
+        if int(config[field]) <= 0:
+            return False, f"{field} must be > 0"
+
+    if int(config["child_max_chars"]) <= int(config["child_target_chars"]):
+        return False, "child_max_chars must be > child_target_chars"
+    if int(config["default_final_k"]) > 40 or int(config["list_question_final_k"]) > 40:
+        return False, "submission evidence count cannot exceed 40"
+    if int(config["max_evidence_for_llm"]) > 40:
+        return False, "max_evidence_for_llm cannot exceed 40"
+    return True, ""
+
+
+def iter_grid_configs(space: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    keys = list(space.keys())
+    configs = []
+    for combo in itertools.product(*(space[key] for key in keys)):
+        config = dict(zip(keys, combo, strict=True))
+        ok, _ = validate_config(config)
+        if ok:
+            configs.append(config)
+    return configs
+
+
+def iter_random_configs(space: dict[str, list[Any]], max_trials: int, seed: int) -> list[dict[str, Any]]:
+    rng = random.Random(seed)
+    configs = []
+    seen = set()
+    max_attempts = max(max_trials * 50, 100)
+
+    for _ in range(max_attempts):
+        if len(configs) >= max_trials:
+            break
+        config = {key: rng.choice(values) for key, values in space.items()}
+        ok, _ = validate_config(config)
+        if not ok:
+            continue
+        sig = json.dumps(config, sort_keys=True, ensure_ascii=False)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        configs.append(config)
+
+    return configs
+
+
+def build_configs(space: dict[str, list[Any]], strategy: str, max_trials: int, seed: int) -> list[dict[str, Any]]:
+    if strategy == "grid":
+        return iter_grid_configs(space)
+    return iter_random_configs(space, max_trials=max_trials, seed=seed)
+
+
+def warn_ignored_params(space: dict[str, list[Any]], mode: str) -> None:
+    if mode != "evidence":
+        return
+    ignored = [key for key in sorted(LLM_ONLY_IN_EVIDENCE_MODE) if len(space[key]) > 1]
+    if ignored:
+        tqdm.write(
+            "Warning: these params are varied but do not affect evidence-only mode: "
+            + ", ".join(ignored)
+        )
+
+
+def load_main_module(main_script: Path):
+    spec = importlib.util.spec_from_file_location("hw2_main_module", main_script)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module from {main_script}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class ModelCache:
+    def __init__(self):
+        self.embed_models: dict[str, Any] = {}
+        self.rerankers: dict[tuple[str, int], Any] = {}
+
+    def get_embed(self, module, model_name: str):
+        if model_name not in self.embed_models:
+            tqdm.write(f"[Init] Loading embedding model: {model_name}")
+            self.embed_models[model_name] = module.SentenceTransformer(model_name)
+        return self.embed_models[model_name]
+
+    def get_reranker(self, module, model_name: str, max_length: int):
+        key = (model_name, max_length)
+        if key not in self.rerankers:
+            tqdm.write(f"[Init] Loading reranker: {model_name} (max_length={max_length})")
+            self.rerankers[key] = module.CrossEncoder(model_name, max_length=max_length)
+        return self.rerankers[key]
+
+
+def capture_originals(module) -> dict[str, Any]:
+    return {
+        "DocumentProcessor": module.DocumentProcessor,
+        "Retriever": module.Retriever,
+        "Generator": module.Generator,
+        "RAGPipeline": module.RAGPipeline,
+        "generate_query_variants": module.generate_query_variants,
+        "classify_question_sections": module.classify_question_sections,
+    }
+
+
+def apply_global_overrides(module, config: dict[str, Any]) -> None:
+    module.EMBED_MODEL = config["embed_model"]
+    module.RERANKER_MODEL = config["reranker_model"]
+    module.LLM_MODEL = config["llm_model"]
+
+    module.CHILD_TARGET_CHARS = int(config["child_target_chars"])
+    module.CHILD_MAX_CHARS = int(config["child_max_chars"])
+    module.PARENT_WINDOW_CHUNKS = int(config["parent_window_chunks"])
+    module.PARENT_MAX_CHARS = int(config["parent_max_chars"])
+    module.CHUNK_SENTENCE_OVERLAP = int(config["chunk_sentence_overlap"])
+
+    module.DENSE_TOP_K = int(config["dense_top_k"])
+    module.BM25_TOP_K = int(config["bm25_top_k"])
+    module.RRF_TOP_K = int(config["rrf_top_k"])
+    module.RRF_K = int(config["rrf_k"])
+    module.DEFAULT_FINAL_K = int(config["default_final_k"])
+    module.RERANK_POOL = int(config["rerank_pool"])
+
+    module.RERANKER_SCORE_THRESHOLD = float(config["reranker_score_threshold"])
+    module.RERANKER_GAP_THRESHOLD = float(config["reranker_gap_threshold"])
+    module.SECTION_BOOST_SCORE = float(config["section_boost_score"])
+
+    module.MAX_EVIDENCE_FOR_LLM = int(config["max_evidence_for_llm"])
+    module.LLM_TEMPERATURE = float(config["llm_temperature"])
+    module.LLM_MAX_TOKENS = int(config["llm_max_tokens"])
+
+
+def install_overrides(module, originals: dict[str, Any], config: dict[str, Any], model_cache: ModelCache) -> None:
+    apply_global_overrides(module, config)
+
+    BaseDocumentProcessor = originals["DocumentProcessor"]
+    BaseRetriever = originals["Retriever"]
+    BaseGenerator = originals["Generator"]
+    BaseRAGPipeline = originals["RAGPipeline"]
+    base_classify_sections = originals["classify_question_sections"]
+
+    sentence_merge_min_chars = int(config["sentence_merge_min_chars"])
+    force_split_window = int(config["force_split_window"])
+    query_prefix = str(config["embed_query_prefix"])
+    relative_threshold = float(config["reranker_relative_threshold"])
+    reranker_max_length = int(config["reranker_max_length"])
+    enable_section_routing = bool(config["enable_section_routing"])
+    enable_hyde = bool(config["enable_hyde"])
+    hyde_temperature = float(config["hyde_temperature"])
+    hyde_max_tokens = int(config["hyde_max_tokens"])
+    enable_stripped_query = bool(config["enable_stripped_query"])
+    enable_keyword_query = bool(config["enable_keyword_query"])
+    max_query_variants = int(config["max_query_variants"])
+    keyword_variant_min_terms = int(config["keyword_variant_min_terms"])
+    stripped_query_min_chars = int(config["stripped_query_min_chars"])
+    list_question_final_k = int(config["list_question_final_k"])
+
+    class ConfigurableDocumentProcessor(BaseDocumentProcessor):
+        def split_sentences(self, text: str) -> list[str]:
+            raw = module.nltk.sent_tokenize(text)
+            merged = []
+            buf = ""
+            for sentence in raw:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                if buf:
+                    buf = buf + " " + sentence
+                    if len(buf) >= sentence_merge_min_chars:
+                        merged.append(buf)
+                        buf = ""
+                elif len(sentence) < sentence_merge_min_chars:
+                    buf = sentence
+                else:
+                    merged.append(sentence)
             if buf:
-                buf = buf + " " + s
-                if len(buf) >= 60:
+                if merged:
+                    merged[-1] = merged[-1] + " " + buf
+                else:
                     merged.append(buf)
-                    buf = ""
-            elif len(s) < 60:
-                buf = s
-            else:
-                merged.append(s)
-        if buf:
-            if merged:
-                merged[-1] = merged[-1] + " " + buf
-            else:
-                merged.append(buf)
-        return merged
+            return merged
 
-    def build_chunks(self, full_text: str) -> list:
-        sentences = self.split_sentences(full_text)
-        if not sentences:
-            return [Chunk(0, full_text[: self.child_max], full_text[: self.parent_max], 0, 0)]
+        def _group_sentences_to_chunks(self, sentences: list[str]) -> list[tuple[int, int, str]]:
+            if not sentences:
+                return []
 
-        child_groups = []
-        current_text = ""
-        start_idx = 0
+            child_groups = []
+            current_sents = []
+            start_idx = 0
 
-        for i, sent in enumerate(sentences):
-            candidate = (current_text + " " + sent).strip() if current_text else sent
-            if current_text and len(candidate) > self.child_target:
-                child_groups.append((start_idx, i - 1, current_text))
-                current_text = sent
-                start_idx = i
-            else:
-                current_text = candidate
+            for i, sent in enumerate(sentences):
+                current_text = " ".join(current_sents + [sent])
+                if current_sents and len(current_text) > self.child_target:
+                    child_groups.append((start_idx, i - 1, " ".join(current_sents)))
+                    overlap_start = max(0, len(current_sents) - self.sentence_overlap)
+                    overlap_sents = current_sents[overlap_start:]
+                    current_sents = overlap_sents + [sent]
+                    start_idx = i - len(overlap_sents)
+                else:
+                    current_sents.append(sent)
 
-        if current_text:
-            child_groups.append((start_idx, len(sentences) - 1, current_text))
+            if current_sents:
+                child_groups.append((start_idx, len(sentences) - 1, " ".join(current_sents)))
 
-        final_groups = []
-        for s, e, text in child_groups:
-            if len(text) <= self.child_max:
-                final_groups.append((s, e, text))
-            else:
+            final_groups = []
+            for s, e, text in child_groups:
+                if len(text) <= self.child_max:
+                    final_groups.append((s, e, text))
+                    continue
+
                 mid = len(text) // 2
-                sp = text.rfind(". ", mid - 80, mid + 80)
+                sp = text.rfind(". ", max(0, mid - force_split_window), mid + force_split_window)
                 if sp == -1:
-                    sp = text.rfind(", ", mid - 80, mid + 80)
+                    sp = text.rfind(", ", max(0, mid - force_split_window), mid + force_split_window)
                 if sp == -1:
                     sp = mid
                 final_groups.append((s, e, text[: sp + 1].strip()))
                 final_groups.append((s, e, text[sp + 1 :].strip()))
+            return final_groups
 
-        chunks = []
-        for idx, (s, e, text) in enumerate(final_groups):
-            pw_lo = max(0, idx - self.parent_window)
-            pw_hi = min(len(final_groups), idx + self.parent_window + 1)
-            parent = " ".join(g[2] for g in final_groups[pw_lo:pw_hi])
-            if len(parent) > self.parent_max:
-                parent = parent[: self.parent_max]
-            chunks.append(Chunk(chunk_id=idx, text=text, parent_text=parent,
-                                sent_start=s, sent_end=e))
-        return chunks
+    class ConfigurableRetriever(BaseRetriever):
+        def __init__(self, logger: logging.Logger):
+            self.logger = logger
+            self.embed_model = model_cache.get_embed(module, module.EMBED_MODEL)
+            self.reranker = model_cache.get_reranker(module, module.RERANKER_MODEL, reranker_max_length)
+            self.chunks = []
+            self.index = None
+            self.bm25 = None
 
+        def _embed_query(self, q: str):
+            prefixed = query_prefix + q
+            return self.embed_model.encode([prefixed], normalize_embeddings=True).astype("float32")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Retriever (same as main, silent mode)
-# ═══════════════════════════════════════════════════════════════════════════════
-class Retriever:
-    def __init__(self, embed_model, reranker_model):
-        self.embed_model = embed_model
-        self.reranker = reranker_model
-        self.chunks = []
-        self.index = None
-        self.bm25 = None
+        def select_dynamic_k(self, reranked: list[tuple[int, float]], max_k: int) -> list[tuple[int, float]]:
+            if not reranked or len(reranked) <= 1:
+                return reranked[:1] if reranked else []
 
-    def build_index(self, chunks: list):
-        self.chunks = chunks
-        if not chunks:
-            return
-        texts = [c.text for c in chunks]
-        embs = self.embed_model.encode(
-            texts, batch_size=64, normalize_embeddings=True, show_progress_bar=False
-        )
-        self.index = faiss.IndexFlatIP(embs.shape[1])
-        self.index.add(embs.astype("float32"))
-        self.bm25 = BM25Okapi([self._tok(t) for t in texts])
+            selected = [reranked[0]]
+            top_score = reranked[0][1]
 
-    @staticmethod
-    def _tok(text: str) -> list:
-        return re.findall(r"\w+", text.lower())
+            for i in range(1, min(len(reranked), max_k)):
+                _, score = reranked[i]
+                prev_score = reranked[i - 1][1]
 
-    def _embed_query(self, q: str):
-        prefixed = "Represent this sentence for searching relevant passages: " + q
-        return self.embed_model.encode([prefixed], normalize_embeddings=True).astype("float32")
+                if score < module.RERANKER_SCORE_THRESHOLD:
+                    break
+                if prev_score - score > module.RERANKER_GAP_THRESHOLD:
+                    break
+                if top_score > 0 and relative_threshold > 0 and score < top_score * relative_threshold:
+                    break
 
-    def dense_search(self, query: str, top_k: int) -> list:
-        if self.index is None or self.index.ntotal == 0:
-            return []
-        k = min(top_k, self.index.ntotal)
-        scores, ids = self.index.search(self._embed_query(query), k)
-        return [(int(i), float(s)) for i, s in zip(ids[0], scores[0]) if i >= 0]
+                selected.append(reranked[i])
 
-    def bm25_search(self, query: str, top_k: int) -> list:
-        if self.bm25 is None:
-            return []
-        scores = self.bm25.get_scores(self._tok(query))
-        ranked = sorted(range(len(scores)), key=lambda i: -scores[i])[:top_k]
-        return [(i, float(scores[i])) for i in ranked]
+            return selected
 
-    @staticmethod
-    def rrf_fuse(*rank_lists, k=RRF_K) -> list:
-        scores = defaultdict(float)
-        for rl in rank_lists:
-            for rank, (doc_id, _) in enumerate(rl):
-                scores[doc_id] += 1.0 / (k + rank + 1)
-        return sorted(scores, key=lambda x: -scores[x])
+    class ConfigurableGenerator(BaseGenerator):
+        def generate_hyde(self, title: str, question: str) -> str:
+            if not enable_hyde:
+                self.logger.debug("[HyDE] disabled")
+                return ""
 
-    def rerank(self, query: str, ids: list, top_k: int) -> list:
-        if not ids:
-            return []
-        pairs = [(query, self.chunks[i].parent_text) for i in ids]
-        scores = self.reranker.predict(pairs, show_progress_bar=False)
-        ranked = sorted(zip(ids, scores), key=lambda x: -x[1])
-        return ranked[:top_k]
+            messages = [
+                {"role": "system", "content":
+                 "You are a scientific paper expert. Given a paper title and question, "
+                 "write a brief passage (2-3 sentences) that might appear in the paper "
+                 "as an answer. Write as if quoting the paper. Be specific and technical."},
+                {"role": "user", "content": f"Paper: {title}\nQuestion: {question}\nPassage:"},
+            ]
+            try:
+                resp = self.client.chat.completions.create(
+                    model=module.LLM_MODEL,
+                    messages=messages,
+                    temperature=hyde_temperature,
+                    max_tokens=hyde_max_tokens,
+                )
+                result = resp.choices[0].message.content.strip()
+                self.logger.debug(f"[HyDE] Generated: {result[:200]}")
+                return result
+            except Exception as exc:
+                self.logger.warning(f"[HyDE] Failed: {exc}")
+                return ""
 
-    def retrieve(self, question: str, variants: list, final_k: int) -> list:
-        if not self.chunks:
-            return []
-        all_dense, all_bm25 = [], []
-        for q in variants:
-            all_dense.extend(self.dense_search(q, DENSE_TOP_K))
-            all_bm25.extend(self.bm25_search(q, BM25_TOP_K))
-        fused = self.rrf_fuse(all_dense, all_bm25)[:RRF_TOP_K]
-        if not fused:
-            return self.chunks[:final_k]
-        reranked = self.rerank(question, fused, final_k)
-        return [self.chunks[i] for i, _ in reranked]
+    def generate_query_variants(question: str) -> list[str]:
+        variants = []
+        seen = set()
 
-    def clear(self):
-        self.chunks, self.index, self.bm25 = [], None, None
+        def add_variant(text: str) -> None:
+            text = text.strip()
+            if not text:
+                return
+            lowered = text.lower()
+            if lowered in seen:
+                return
+            seen.add(lowered)
+            variants.append(text)
 
+        add_variant(question)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Generator (silent mode, no LLM calls during ablation)
-# ═══════════════════════════════════════════════════════════════════════════════
-class Generator:
-    # Generator 結構留存，但在此次評估腳本中暫不呼叫以節省時間與花費
-    pass
+        if enable_stripped_query:
+            stripped = re.sub(
+                r"^(what|which|how|why|where|when|who|does|do|did|is|are|was|were|can|could)"
+                r"\s+(is|are|was|were|does|do|did|the|a|an|this|that)?\s*",
+                "",
+                question,
+                flags=re.IGNORECASE,
+            ).strip().rstrip("?").strip()
+            if len(stripped) >= stripped_query_min_chars:
+                add_variant(stripped)
 
+        if enable_keyword_query:
+            words = re.findall(r"\b[a-zA-Z]{3,}\b", question)
+            keywords = [word for word in words if word.lower() not in module._STOP_WORDS]
+            if len(keywords) >= keyword_variant_min_terms:
+                add_variant(" ".join(keywords))
 
-def generate_query_variants(question: str) -> list:
-    variants = [question]
-    stripped = re.sub(
-        r"^(what|which|how|why|where|when|who|does|do|did|is|are|was|were|can|could)"
-        r"\s+(is|are|was|were|does|do|did|the|a|an|this|that)?\s*",
-        "", question, flags=re.IGNORECASE
-    ).strip().rstrip("?").strip()
-    if stripped and stripped.lower() != question.lower() and len(stripped) > 10:
-        variants.append(stripped)
-    words = re.findall(r"\b[a-zA-Z]{3,}\b", question)
-    kw = [w for w in words if w.lower() not in _STOP_WORDS]
-    if len(kw) >= 2:
-        variants.append(" ".join(kw))
-    return variants[:3]
+        return variants[:max_query_variants]
 
+    def classify_question_sections(question: str) -> set[str]:
+        if not enable_section_routing:
+            return set()
+        return base_classify_sections(question)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Evaluator
-# ═══════════════════════════════════════════════════════════════════════════════
-class Evaluator:
-    def __init__(self):
-        self.scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-
-    def evidence_score_single(self, retrieved: list, golden: list) -> float:
-        if not golden:
-            return 1.0
-        if not retrieved:
-            return 0.0
-        total = 0.0
-        for chunk in retrieved:
-            result = self.scorer.score_multi(targets=golden, prediction=chunk)
-            total += result["rougeL"].fmeasure
-        return total / len(retrieved)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Ablation Pipeline
-# ═══════════════════════════════════════════════════════════════════════════════
-class AblationPipeline:
-    def __init__(self, api_key: str, embed_model, reranker_model):
-        self.api_key = api_key
-        self.embed_model = embed_model
-        self.reranker_model = reranker_model
-        self.evaluator = Evaluator()
-
-    @staticmethod
     def determine_k(question: str) -> int:
         q = question.lower()
-        list_kw = [
-            "list", "what are the", "which", "name the", "how many",
-            "what methods", "what techniques", "what datasets",
-            "what approaches", "what models", "what features",
-        ]
-        return 8 if any(k in q for k in list_kw) else DEFAULT_FINAL_K
+        return list_question_final_k if any(keyword in q for keyword in LIST_QUESTION_KEYWORDS) else module.DEFAULT_FINAL_K
 
-    def process_paper(self, entry: dict, processor: DocumentProcessor, retriever: Retriever) -> float:
-        full_text = entry["full_text"]
-        question = entry["question"]
+    module.DocumentProcessor = ConfigurableDocumentProcessor
+    module.Retriever = ConfigurableRetriever
+    module.Generator = ConfigurableGenerator
+    module.generate_query_variants = generate_query_variants
+    module.classify_question_sections = classify_question_sections
+    module.RAGPipeline = BaseRAGPipeline
+    module.RAGPipeline.determine_k = staticmethod(determine_k)
 
-        chunks = processor.build_chunks(full_text)
+
+def ensure_dataset_has_labels(dataset: list[dict[str, Any]], optimize: str, official_score: bool) -> None:
+    need_answers = official_score or optimize in {"official_correctness", "official_combined_score"}
+    missing_evidence = any("evidence" not in item for item in dataset)
+    missing_answer = any("answer" not in item for item in dataset)
+
+    if missing_evidence:
+        raise ValueError("Dataset must contain `evidence` for tuning/score evaluation.")
+    if need_answers and missing_answer:
+        raise ValueError("Dataset must contain `answer` when official correctness scoring is requested.")
+
+
+def maybe_require_api_key(module, configs: list[dict[str, Any]], mode: str) -> str:
+    llm_needed = mode == "full" or any(bool(cfg["enable_hyde"]) for cfg in configs)
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    base_url = str(getattr(module, "LLM_BASE_URL", ""))
+
+    if llm_needed and "openrouter" in base_url.lower() and not api_key:
+        raise EnvironmentError("OPENROUTER_API_KEY is required because the tuned pipeline will call OpenRouter.")
+
+    return api_key or "ollama"
+
+
+def score_evidence_only(
+    module,
+    config: dict[str, Any],
+    dataset: list[dict[str, Any]],
+    logger: logging.Logger,
+    api_key: str,
+) -> dict[str, Any]:
+    processor = module.DocumentProcessor(logger)
+    retriever = module.Retriever(logger)
+    generator = module.Generator(api_key=api_key, logger=logger) if bool(config["enable_hyde"]) else None
+    evaluator = module.Evaluator()
+
+    per_paper_scores = []
+    predictions = []
+
+    iterator = tqdm(dataset, desc="  Papers", unit="paper", leave=False, dynamic_ncols=True)
+    for entry in iterator:
+        chunks = processor.build_chunks(entry["full_text"])
         if not chunks:
-            return 0.0
+            per_paper_scores.append(0.0)
+            predictions.append({"title": entry["title"], "answer": "", "evidence": []})
+            continue
 
         retriever.build_index(chunks)
+        variants = module.generate_query_variants(entry["question"])
+        target_sections = module.classify_question_sections(entry["question"])
+        hyde_text = ""
+        if generator is not None:
+            hyde_text = generator.generate_hyde(entry["title"], entry["question"])
 
-        variants = generate_query_variants(question)
-        k = self.determine_k(question)
-        retrieved = retriever.retrieve(question, variants, k)
+        final_k = module.RAGPipeline.determine_k(entry["question"])
+        retrieved, _ = retriever.retrieve(
+            entry["question"],
+            variants,
+            final_k,
+            hyde_text=hyde_text,
+            target_sections=target_sections,
+        )
         retriever.clear()
 
-        golden_ev = entry.get("evidence", [])
-        score = self.evaluator.evidence_score_single([c.text for c in retrieved], golden_ev)
+        evidence = [chunk.text for chunk in retrieved]
+        score = evaluator.evidence_score_single(evidence, entry.get("evidence", []))
+        per_paper_scores.append(score)
+        predictions.append({"title": entry["title"], "answer": "", "evidence": evidence})
 
-        return score
-
-    def run_config(
-        self,
-        dataset: list,
-        child_target: int,
-        child_max: int,
-        parent_window: int,
-        parent_max: int,
-        show_paper_progress: bool = False,
-        config_idx: int = 0,
-        total_configs: int = 0,
-        status_every: int = 5,
-    ) -> dict:
-        """Run evaluation for one config across all dataset papers."""
-        scores = []
-        processor = DocumentProcessor(child_target, child_max, parent_window, parent_max)
-        retriever = Retriever(self.embed_model, self.reranker_model)
-        n_papers = len(dataset)
-        t0 = time.time()
-
-        if show_paper_progress:
-            desc_str = f"  ct={child_target} cm={child_max} pw={parent_window} pm={parent_max}"
-            iterator = tqdm(dataset, desc=desc_str, unit="paper", leave=False, dynamic_ncols=True)
-            for entry in iterator:
-                score = self.process_paper(entry, processor, retriever)
-                scores.append(score)
-        else:
-            if total_configs > 0 and config_idx > 0:
-                tqdm.write(f"[Config {config_idx}/{total_configs}]")
-                tqdm.write(f"  params: ct={child_target} cm={child_max} pw={parent_window} pm={parent_max}")
-            for i, entry in enumerate(dataset, 1):
-                score = self.process_paper(entry, processor, retriever)
-                scores.append(score)
-                if status_every > 0 and (i % status_every == 0 or i == n_papers):
-                    elapsed = time.time() - t0
-                    tqdm.write(
-                        f"  papers: {i}/{n_papers} "
-                        f"(elapsed {elapsed:.1f}s, avg {elapsed/max(i, 1):.2f}s/paper)"
-                    )
-
-        return {
-            "child_target": child_target,
-            "child_max": child_max,
-            "parent_window": parent_window,
-            "parent_max": parent_max,
-            "mean_score": sum(scores) / len(scores) if scores else 0.0,
-            "min_score": min(scores) if scores else 0.0,
-            "max_score": max(scores) if scores else 0.0,
-            "n": len(scores),
-            "scores": scores,
-        }
+    mean_score = statistics.mean(per_paper_scores) if per_paper_scores else 0.0
+    return {
+        "mean_evidence_score": mean_score,
+        "min_evidence_score": min(per_paper_scores) if per_paper_scores else 0.0,
+        "max_evidence_score": max(per_paper_scores) if per_paper_scores else 0.0,
+        "std_evidence_score": statistics.pstdev(per_paper_scores) if len(per_paper_scores) > 1 else 0.0,
+        "n": len(per_paper_scores),
+        "per_paper_scores": per_paper_scores,
+        "predictions": predictions,
+    }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════════════
-def main():
-    parser = argparse.ArgumentParser(description="Ablation Study: Tuning all 4 Chunking Parameters")
-    parser.add_argument("--sample", type=int, default=EVAL_SAMPLE_SIZE,
-                        help=f"Papers to sample (0=all, default={EVAL_SAMPLE_SIZE})")
-    parser.add_argument("--seed", type=int, default=SEED, help="Random seed")
-    parser.add_argument("--output", type=str, default="outputs/ablation_results.csv",
-                        help="Output CSV file path")
-    parser.add_argument(
-        "--paper-progress",
-        action="store_true",
-        help="Show per-paper progress bar for each config (slower due to frequent terminal updates)",
-    )
-    parser.add_argument(
-        "--status-every",
-        type=int,
-        default=5,
-        help="When --paper-progress is off, print status every N papers (0=disable, default=5)",
-    )
-    args = parser.parse_args()
+def score_full_pipeline(module, dataset: list[dict[str, Any]], logger: logging.Logger, api_key: str) -> dict[str, Any]:
+    pipeline = module.RAGPipeline(api_key=api_key, logger=logger)
+    evaluator = module.Evaluator()
 
-    script_dir = Path(__file__).resolve().parent
+    per_paper_scores = []
+    predictions = []
 
-    # Load API key
-    api_key = os.environ.get("OPENROUTER_API_KEY", "ollama")
-    if not api_key:
-        tqdm.write("ERROR: Set OPENROUTER_API_KEY")
-        sys.exit(1)
+    iterator = tqdm(dataset, desc="  Papers", unit="paper", leave=False, dynamic_ncols=True)
+    for entry in iterator:
+        result = pipeline.process_paper(entry)
+        evidence_score = evaluator.evidence_score_single(result.evidence, entry.get("evidence", []))
+        per_paper_scores.append(evidence_score)
+        predictions.append({
+            "title": result.title,
+            "answer": result.answer,
+            "evidence": result.evidence,
+        })
 
-    # Load dataset
-    dataset_path = script_dir / "public_dataset.json"
-    if not dataset_path.exists():
-        dataset_path = script_dir / "datasets" / "public_dataset.json"
+    mean_score = statistics.mean(per_paper_scores) if per_paper_scores else 0.0
+    return {
+        "mean_evidence_score": mean_score,
+        "min_evidence_score": min(per_paper_scores) if per_paper_scores else 0.0,
+        "max_evidence_score": max(per_paper_scores) if per_paper_scores else 0.0,
+        "std_evidence_score": statistics.pstdev(per_paper_scores) if len(per_paper_scores) > 1 else 0.0,
+        "n": len(per_paper_scores),
+        "per_paper_scores": per_paper_scores,
+        "predictions": predictions,
+    }
 
-    with open(dataset_path) as f:
-        dataset = json.load(f)
 
-    # Sample if requested
-    if args.sample > 0 and args.sample < len(dataset):
-        random.seed(args.seed)
-        dataset = random.sample(dataset, args.sample)
-        tqdm.write(f"Sampled {len(dataset)} papers (seed={args.seed})")
-
-    tqdm.write(f"Loaded {len(dataset)} papers from {dataset_path.name}\n")
-
-    # Load models (once, reused across configs)
-    tqdm.write("Loading models...")
-    embed_model = SentenceTransformer(EMBED_MODEL)
-    reranker_model = CrossEncoder(RERANKER_MODEL)
-    tqdm.write(f"  Embedding: {EMBED_MODEL}")
-    tqdm.write(f"  Reranker:  {RERANKER_MODEL}\n")
-
-    pipeline = AblationPipeline(api_key, embed_model, reranker_model)
-
-    # Generate valid configurations
-    valid_configs = []
-    for ct, cm, pw, pm in itertools.product(CHILD_TARGETS, CHILD_MAXS, PARENT_WINDOWS, PARENT_MAXS):
-        if cm <= ct:
-            continue # 不合理的組合 (max小於或等於target) 予以略過
-        valid_configs.append((ct, cm, pw, pm))
-
-    total_configs = len(valid_configs)
-
-    tqdm.write(f"Ablation Study Parameters:")
-    tqdm.write(f"  CHILD_TARGETS : {CHILD_TARGETS}")
-    tqdm.write(f"  CHILD_MAXS    : {CHILD_MAXS}")
-    tqdm.write(f"  PARENT_WINDOWS: {PARENT_WINDOWS}")
-    tqdm.write(f"  PARENT_MAXS   : {PARENT_MAXS}")
-    tqdm.write(f"  Total valid configurations to run: {total_configs}\n")
-    if not args.paper_progress:
-        tqdm.write(f"Per-paper progress: OFF (faster), status every {args.status_every} papers\n")
-
-    results = []
-    best_mean = float("-inf")
-
-    with tqdm(total=total_configs, desc="Overall Progress", unit="config") as pbar_overall:
-        for idx, (ct, cm, pw, pm) in enumerate(valid_configs, 1):
-            config_t0 = time.time()
-            result = pipeline.run_config(
-                dataset,
-                ct,
-                cm,
-                pw,
-                pm,
-                show_paper_progress=args.paper_progress,
-                config_idx=idx,
-                total_configs=total_configs,
-                status_every=args.status_every,
-            )
-            results.append(result)
-            pbar_overall.update(1)
-            if result["mean_score"] > best_mean:
-                best_mean = result["mean_score"]
-            pbar_overall.set_postfix_str(f"best={best_mean:.5f}")
-            tqdm.write(
-                f"[Config {idx}/{total_configs}] "
-                f"mean_score={result['mean_score']:.5f} "
-                f"(elapsed {time.time() - config_t0:.1f}s)"
-            )
-
-    # Sort by mean score descending
-    results.sort(key=lambda r: r["mean_score"], reverse=True)
-
-    # Save CSV
-    output_path = Path(args.output)
-    with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "rank", "child_target", "child_max", "parent_window", "parent_max",
-            "mean_score", "min_score", "max_score", "std_dev", "n"
-        ])
-        writer.writeheader()
-
-        import statistics
-        for rank, r in enumerate(results, 1):
-            std = statistics.stdev(r["scores"]) if len(r["scores"]) > 1 else 0.0
-            writer.writerow({
-                "rank": rank,
-                "child_target": r["child_target"],
-                "child_max": r["child_max"],
-                "parent_window": r["parent_window"],
-                "parent_max": r["parent_max"],
-                "mean_score": round(r["mean_score"], 5),
-                "min_score": round(r["min_score"], 5),
-                "max_score": round(r["max_score"], 5),
-                "std_dev": round(std, 5),
-                "n": r["n"],
-            })
-
-    # Save JSON with detailed scores
-    json_path = output_path.with_suffix(".json")
-    with open(json_path, "w") as f:
-        json.dump([
-            {
-                "rank": rank,
-                "child_target": r["child_target"],
-                "child_max": r["child_max"],
-                "parent_window": r["parent_window"],
-                "parent_max": r["parent_max"],
-                "mean_score": r["mean_score"],
-                "scores": [round(s, 5) for s in r["scores"]],
-            }
-            for rank, r in enumerate(results, 1)
-        ], f, indent=2)
-
-    # Print summary
-    tqdm.write("\n" + "="*70)
-    tqdm.write("TOP 5 CONFIGURATIONS")
-    tqdm.write("="*70)
-    for rank, r in enumerate(results[:5], 1):
-        tqdm.write(
-            f"{rank}. Target={r['child_target']:>3}  Max={r['child_max']:>3}  "
-            f"Win={r['parent_window']}  P_Max={r['parent_max']:>4}  |  "
-            f"Score={r['mean_score']:.5f}"
+def run_official_score(
+    prediction_path: Path,
+    dataset_path: Path,
+    judge_host: str,
+    judge_port: int,
+    judge_model: str,
+    judge_times: int,
+) -> dict[str, float]:
+    score_script = SCRIPT_DIR / "score_public.py"
+    cmd = [
+        sys.executable,
+        str(score_script),
+        str(prediction_path),
+        "--host", judge_host,
+        "--port", str(judge_port),
+        "--model", judge_model,
+        "--dataset", str(dataset_path),
+        "--times", str(judge_times),
+    ]
+    proc = subprocess.run(cmd, cwd=SCRIPT_DIR, text=True, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "score_public.py failed.\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
         )
 
-    tqdm.write("="*70)
-    tqdm.write(f"\nResults saved:")
-    tqdm.write(f"  CSV:  {output_path}")
+    score_json = prediction_path.with_name(prediction_path.stem + "_score.json")
+    if not score_json.exists():
+        raise FileNotFoundError(f"Official score JSON not found: {score_json}")
+
+    with score_json.open(encoding="utf-8") as f:
+        summary = json.load(f)["summary"]
+
+    return {
+        "official_evidence_score": float(summary["evidence_score"]),
+        "official_correctness": float(summary["correctness"]),
+        "official_combined_score": (float(summary["evidence_score"]) + float(summary["correctness"])) / 2.0,
+    }
+
+
+def objective_value(metrics: dict[str, Any], optimize: str) -> float:
+    value = metrics.get(optimize)
+    if value is None:
+        raise KeyError(f"Metric {optimize} is not available for this run.")
+    return float(value)
+
+
+def save_trial_artifacts(
+    output_dir: Path,
+    trial_idx: int,
+    predictions: list[dict[str, Any]],
+    official_metrics: dict[str, float] | None,
+    keep_trial_files: bool,
+) -> None:
+    if not keep_trial_files:
+        return
+
+    trials_dir = output_dir / "trials"
+    trials_dir.mkdir(parents=True, exist_ok=True)
+    pred_path = trials_dir / f"trial_{trial_idx:03d}.json"
+    dump_json(predictions, pred_path)
+
+    if official_metrics is not None:
+        dump_json(official_metrics, trials_dir / f"trial_{trial_idx:03d}_official_score.json")
+
+
+def format_config(config: dict[str, Any]) -> str:
+    return (
+        f"ct={config['child_target_chars']} cm={config['child_max_chars']} "
+        f"pw={config['parent_window_chunks']} pm={config['parent_max_chars']} ov={config['chunk_sentence_overlap']} "
+        f"d/b/r={config['dense_top_k']}/{config['bm25_top_k']}/{config['rrf_top_k']} "
+        f"pool={config['rerank_pool']} fk={config['default_final_k']} lk={config['list_question_final_k']} "
+        f"hyde={'on' if config['enable_hyde'] else 'off'} sec={'on' if config['enable_section_routing'] else 'off'}"
+    )
+
+
+def save_results(output_dir: Path, optimize: str, results: list[dict[str, Any]], best_result: dict[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    csv_path = output_dir / f"tuning_results_{timestamp}.csv"
+    json_path = output_dir / f"tuning_results_{timestamp}.json"
+    best_path = output_dir / "best_config.json"
+    best_space_path = output_dir / "best_search_space.json"
+
+    metric_columns = [
+        "objective_value",
+        "mean_evidence_score",
+        "min_evidence_score",
+        "max_evidence_score",
+        "std_evidence_score",
+        "official_evidence_score",
+        "official_correctness",
+        "official_combined_score",
+        "elapsed_seconds",
+        "n",
+    ]
+    config_columns = list(SEARCH_SPACE.keys())
+    fieldnames = ["rank", "trial"] + metric_columns + config_columns
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rank, item in enumerate(results, 1):
+            row = {key: item.get(key) for key in fieldnames}
+            row["rank"] = rank
+            writer.writerow(row)
+
+    dump_json(
+        {
+            "optimize": optimize,
+            "results": results,
+            "best": best_result,
+        },
+        json_path,
+    )
+    dump_json(best_result, best_path)
+    dump_json({key: [best_result[key]] for key in config_columns}, best_space_path)
+
+    tqdm.write(f"\nSaved results:")
+    tqdm.write(f"  CSV : {csv_path}")
     tqdm.write(f"  JSON: {json_path}")
+    tqdm.write(f"  Best: {best_path}")
+    tqdm.write(f"  Re-run best config with: {best_space_path}")
 
-    # Comparison with baselines
-    best = results[0]
-    tqdm.write(f"\nBest configuration:")
-    tqdm.write(f"  CHILD_TARGET_CHARS   = {best['child_target']}")
-    tqdm.write(f"  CHILD_MAX_CHARS      = {best['child_max']}")
-    tqdm.write(f"  PARENT_WINDOW_CHUNKS = {best['parent_window']}")
-    tqdm.write(f"  PARENT_MAX_CHARS     = {best['parent_max']}")
-    tqdm.write(f"  Evidence Score       = {best['mean_score']:.5f}")
 
-    tqdm.write(f"\nComparison with baselines:")
-    tqdm.write(f"  Weak baseline       : 0.2124")
-    tqdm.write(f"  Strong baseline     : 0.26185")
-    tqdm.write(f"  Best ablation       : {best['mean_score']:.5f}")
-    if best["mean_score"] > 0.26185:
-        tqdm.write(f"  ✓ Beats strong baseline by {(best['mean_score'] - 0.26185):.5f}")
-    elif best["mean_score"] > 0.2124:
-        tqdm.write(f"  ✓ Beats weak baseline by {(best['mean_score'] - 0.2124):.5f}")
-    else:
-        tqdm.write(f"  ✗ Below weak baseline, needs tuning")
+def main() -> None:
+    args = parse_args()
+    output_dir = Path(args.output_dir)
+    logger, log_path = setup_logger(output_dir, verbose=args.verbose)
+
+    search_space = {key: list(values) for key, values in SEARCH_SPACE.items()}
+
+    if args.official_score and args.mode != "full":
+        raise ValueError("--official-score requires --mode full")
+    if args.optimize != "mean_evidence_score" and not args.official_score:
+        raise ValueError(f"--optimize {args.optimize} requires --official-score")
+
+    warn_ignored_params(search_space, args.mode)
+
+    dataset_path = resolve_dataset_path(args.dataset)
+    dataset = load_dataset(dataset_path, sample=args.sample, seed=args.seed)
+    ensure_dataset_has_labels(dataset, optimize=args.optimize, official_score=args.official_score)
+
+    main_script = Path(args.main_script)
+    if not main_script.exists():
+        raise FileNotFoundError(f"Main script not found: {main_script}")
+
+    total_grid = grid_size(search_space)
+    configs = build_configs(search_space, strategy=args.strategy, max_trials=args.max_trials, seed=args.seed)
+    if not configs:
+        raise ValueError("No valid configurations generated from the search space.")
+
+    tqdm.write(f"{'#' * 70}")
+    tqdm.write("Comprehensive HW2 Hyperparameter Tuner")
+    tqdm.write(f"{'#' * 70}")
+    tqdm.write(f"  Main script : {main_script}")
+    tqdm.write(f"  Dataset     : {dataset_path}")
+    tqdm.write(f"  Mode        : {args.mode}")
+    tqdm.write(f"  Optimize    : {args.optimize}")
+    tqdm.write(f"  Strategy    : {args.strategy}")
+    tqdm.write(f"  Sample      : {len(dataset)} papers")
+    tqdm.write(f"  Grid size   : {total_grid}")
+    tqdm.write(f"  Trials      : {len(configs)}")
+    tqdm.write(f"  Output dir  : {output_dir}")
+    tqdm.write(f"  Log file    : {log_path}\n")
+
+    module = load_main_module(main_script)
+    originals = capture_originals(module)
+    model_cache = ModelCache()
+    api_key = maybe_require_api_key(module, configs=configs, mode=args.mode)
+
+    results = []
+    best_result = None
+    best_score = float("-inf")
+
+    with tqdm(total=len(configs), desc="Overall Progress", unit="trial") as progress:
+        for trial_idx, config in enumerate(configs, 1):
+            install_overrides(module, originals, config, model_cache)
+            logger.debug("Trial %s config: %s", trial_idx, json.dumps(config, ensure_ascii=False, sort_keys=True))
+
+            tqdm.write(f"[Trial {trial_idx}/{len(configs)}] {format_config(config)}")
+            start_time = time.time()
+
+            if args.mode == "evidence":
+                metrics = score_evidence_only(module, config=config, dataset=dataset, logger=logger, api_key=api_key)
+            else:
+                metrics = score_full_pipeline(module, dataset=dataset, logger=logger, api_key=api_key)
+
+            official_metrics = None
+            if args.official_score:
+                if args.keep_trial_files:
+                    prediction_path = output_dir / "trials" / f"trial_{trial_idx:03d}.json"
+                    prediction_path.parent.mkdir(parents=True, exist_ok=True)
+                    dump_json(metrics["predictions"], prediction_path)
+                    official_metrics = run_official_score(
+                        prediction_path=prediction_path,
+                        dataset_path=dataset_path,
+                        judge_host=args.judge_host,
+                        judge_port=args.judge_port,
+                        judge_model=args.judge_model,
+                        judge_times=args.judge_times,
+                    )
+                else:
+                    with tempfile.TemporaryDirectory(prefix="hw2_tuner_") as tmp_dir:
+                        prediction_path = Path(tmp_dir) / f"trial_{trial_idx:03d}.json"
+                        dump_json(metrics["predictions"], prediction_path)
+                        official_metrics = run_official_score(
+                            prediction_path=prediction_path,
+                            dataset_path=dataset_path,
+                            judge_host=args.judge_host,
+                            judge_port=args.judge_port,
+                            judge_model=args.judge_model,
+                            judge_times=args.judge_times,
+                        )
+
+            elapsed = time.time() - start_time
+            record = {
+                "trial": trial_idx,
+                "elapsed_seconds": round(elapsed, 3),
+                **config,
+                **{k: v for k, v in metrics.items() if k != "predictions" and k != "per_paper_scores"},
+            }
+            if official_metrics is not None:
+                record.update(official_metrics)
+            else:
+                record.setdefault("official_evidence_score", None)
+                record.setdefault("official_correctness", None)
+                record.setdefault("official_combined_score", None)
+
+            record["objective_value"] = round(objective_value(record, args.optimize), 6)
+            results.append(record)
+
+            save_trial_artifacts(
+                output_dir=output_dir,
+                trial_idx=trial_idx,
+                predictions=metrics["predictions"],
+                official_metrics=official_metrics,
+                keep_trial_files=args.keep_trial_files,
+            )
+
+            if record["objective_value"] > best_score:
+                best_score = record["objective_value"]
+                best_result = record
+
+            progress.update(1)
+            progress.set_postfix_str(f"best={best_score:.5f}")
+
+            summary = f"mean_evidence={record['mean_evidence_score']:.5f}"
+            if record["official_combined_score"] is not None:
+                summary += (
+                    f", official_evidence={record['official_evidence_score']:.5f},"
+                    f" official_correctness={record['official_correctness']:.5f},"
+                    f" combined={record['official_combined_score']:.5f}"
+                )
+            tqdm.write(f"  -> {summary} (elapsed {elapsed:.1f}s)")
+
+    if best_result is None:
+        raise RuntimeError("No result was produced.")
+
+    results.sort(key=lambda item: item["objective_value"], reverse=True)
+    save_results(output_dir=output_dir, optimize=args.optimize, results=results, best_result=best_result)
+
+    tqdm.write("\nTop 5 configurations:")
+    for rank, item in enumerate(results[:5], 1):
+        tqdm.write(
+            f"{rank}. score={item['objective_value']:.5f}  "
+            f"evidence={item['mean_evidence_score']:.5f}  "
+            f"{format_config(item)}"
+        )
+
+    tqdm.write("\nBest configuration:")
+    tqdm.write(json.dumps(best_result, indent=2, ensure_ascii=False))
+    tqdm.write(f"\nTuner log saved -> {log_path}")
 
 
 if __name__ == "__main__":
