@@ -1,13 +1,12 @@
 # Generative Artificial Intelligence Projects
 
-這個 repository 收錄我在生成式人工智慧課程中完成的兩個 NLP 專案，主題分別是醫學病理選擇題問答與以論文為基礎的文件問答系統。兩份作業都不是只停留在模型呼叫，而是從資料處理、prompt 設計、模型/檢索策略、評估到實驗迭代都完整實作。
+Instructor: 帥宏翰
 
-如果你是招募方或工程主管，可以先看下面這張表：
 
-| Project | Problem | What I built | Outcome |
-| --- | --- | --- | --- |
-| [HW1](./HW1) | Pathology multiple-choice QA | 以 `unsloth/Llama-3.2-1B-Instruct` 做 4-bit LoRA 微調，搭配 few-shot CoT prompt 與答案格式約束 | 內部分割驗證集準確率 **71.11%** |
-| [HW2](./HW2) | Document QA over 200 NLP papers | 建立完整 RAG pipeline：parent-child chunking、FAISS + BM25 混合檢索、HyDE、RRF、reranker、LLM generation | 保存的公開測試版本顯示 evidence score 最高到 **0.2798**；另有系統化 ablation 實驗 |
+| Project      | Problem                         | What I built                                                                                             | Outcome                                                                          |
+| ------------ | ------------------------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| [HW1](./HW1) | Pathology multiple-choice QA    | 以`unsloth/Llama-3.2-1B-Instruct` 做 4-bit LoRA 微調，搭配 few-shot CoT prompt 與答案格式約束            | 內部分割驗證集準確率**71.11%**                                                   |
+| [HW2](./HW2) | Document QA over 200 NLP papers | 建立完整 RAG pipeline：parent-child chunking、FAISS + BM25 混合檢索、HyDE、RRF、reranker、LLM generation | 保存的公開測試版本顯示 evidence score 最高到**0.2798**；另有系統化 ablation 實驗 |
 
 ## Why This Repo Is Worth Reading
 
@@ -87,6 +86,7 @@
 - [HW2](./HW2): 論文文件問答系統，重點在 RAG pipeline 與 retrieval experimentation
 
 註：
+
 - HW1 的 71.11% 來自 notebook 中保存的 validation output。
 - HW2 的 0.2554 來自 `ablation_results_v1.csv`。
 - HW2 的 0.2798 來自已保存提交檔名 `cor_50_evi_0.2798.json`，此處依檔名做結果標示。
