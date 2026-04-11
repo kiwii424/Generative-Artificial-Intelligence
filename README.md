@@ -5,7 +5,7 @@ Instructor: 帥宏翰
 
 | Project      | Problem                         | What I built                                                                                             | Outcome                                                                          |
 | ------------ | ------------------------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| [HW1](./HW1) | Pathology multiple-choice QA    | 以`unsloth/Llama-3.2-1B-Instruct` 做 4-bit LoRA 微調，搭配 few-shot CoT prompt 與答案格式約束            | 內部分割驗證集準確率**71.11%**                                                   |
+| [HW1](./HW1) | Pathology multiple-choice QA    | 以`unsloth/Llama-3.2-1B-Instruct` 做 4-bit LoRA 微調，加入資料增強、hard example mining 與兩階段再訓練   |  hold-out accuracy**74.86%**                                                    |
 | [HW2](./HW2) | Document QA over 200 NLP papers | 建立完整 RAG pipeline：parent-child chunking、FAISS + BM25 混合檢索、HyDE、RRF、reranker、LLM generation | 保存的公開測試版本顯示 evidence score 最高到**0.2798**；另有系統化 ablation 實驗 |
 
 ## Why This Repo Is Worth Reading
@@ -16,15 +16,16 @@ Instructor: 帥宏翰
 
 ## HW1: Pathology QA
 
-目標是解決病理學單選題問答。資料格式包含題目、四個選項與正確答案，最後需要輸出符合競賽格式的提交結果。核心實作在 [HW1/main.ipynb](./HW1/main.ipynb)。
+目標是解決病理學單選題問答。資料格式包含題目、四個選項與正確答案，最後需要輸出符合競賽格式的提交結果。最新核心實作在 [HW1/main.py](./HW1/main.py)。
 
 我採用的方法：
 
 - 使用 `unsloth/Llama-3.2-1B-Instruct` 作為基底模型，透過 **4-bit quantization + LoRA** 降低訓練資源需求
 - 設計 **few-shot prompt**，在 prompt 中加入病理學示例題，並要求模型只輸出 `A / B / C / D`
-- 在 system prompt 中加入 **Chain-of-Thought 導向**，讓模型先做病理判斷再輸出最終答案，但在輸出格式上嚴格限制只保留選項字母
-- 以 `SFTTrainer` 進行 supervised fine-tuning，並搭配 completion-only loss 讓模型專注學習答案區段
-- 針對驗證流程實作自動化推論、regex 後處理、classification report 與 confusion matrix 分析
+- 建立全域選項池，對訓練集做 distractor replacement augmentation，將訓練資料擴充為原始資料的 2 倍
+- 以 `SFTTrainer` 進行第一階段 supervised fine-tuning，並搭配 completion-only loss 讓模型專注學習答案區段
+- 再透過 **hard example mining + stage 2 retraining**，集中修正第一階段容易答錯的題目
+- 針對驗證流程實作錯誤報告、訓練曲線、混淆矩陣與 benchmark majority-voting submission
 
 這份作業展現的能力：
 
@@ -32,10 +33,9 @@ Instructor: 帥宏翰
 - Prompt 設計與輸出格式控制
 - 醫學問答場景下的模型評估與誤差分析
 
-目前 notebook 中保存的結果為：
+目前 `main.py` 的結果為：
 
-- 內部分割驗證集準確率：**71.11%**
-- Macro F1：約 **0.70**
+- hold-out accuracy：**74.86%**
 
 ## HW2: Document QA Based on RAG
 
@@ -87,6 +87,6 @@ Instructor: 帥宏翰
 
 註：
 
-- HW1 的 71.11% 來自 notebook 中保存的 validation output。
+- HW1 的 74.86% 來自目前 `HW1/main.py` 版本的最新結果。
 - HW2 的 0.2554 來自 `ablation_results_v1.csv`。
 - HW2 的 0.2798 來自已保存提交檔名 `cor_50_evi_0.2798.json`，此處依檔名做結果標示。
