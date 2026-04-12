@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
 HW2: Document QA based on RAG
-Student ID: 111511157
 
-Pipeline (v2 — Optimized):
-  Section-Aware Chunking with Sentence Overlap
-  → Query Routing (section classification)
-  → Hybrid Retrieval (Dense FAISS + BM25) with Section Boosting
-  → RRF Fusion → Cross-Encoder Reranking
-  → Aggressive Dynamic-K Evidence Selection
-  → LLM Answer Generation (Llama-3.2-3B via OpenRouter) with CoT Prompt
+
+Default LLM provider: openrouter
+For local Ollama, prefix commands with LLM_PROVIDER=ollama
 
 Usage:
   uv run python 111511157.py                                                    # Process private_dataset.json
@@ -44,10 +39,6 @@ from dotenv import load_dotenv
 # 載入 .env 變數
 load_dotenv()
 
-api_key = os.getenv("OPENROUTER_API_KEY")
-if not api_key:
-    print("no api key found. Please set OPENROUTER_API_KEY in your environment variables.")
-
 nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
@@ -75,7 +66,7 @@ def setup_logging(log_dir: Path) -> logging.Logger:
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s", "%H:%M:%S"))
+    # fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s", "%H:%M:%S"))
     logger.addHandler(fh)
 
     ch = logging.StreamHandler(sys.stderr)
@@ -91,8 +82,25 @@ def setup_logging(log_dir: Path) -> logging.Logger:
 # ═══════════════════════════════════════════════════════════════════════════════
 EMBED_MODEL = "BAAI/bge-large-en-v1.5"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
-LLM_MODEL = "meta-llama/llama-3.2-3b-instruct"
-LLM_BASE_URL = "https://openrouter.ai/api/v1"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+LLM_MODEL = os.getenv(
+    "LLM_MODEL",
+    "llama3.2:3b" if LLM_PROVIDER == "ollama" else "meta-llama/llama-3.2-3b-instruct",
+)
+LLM_BASE_URL = os.getenv(
+    "LLM_BASE_URL",
+    "http://127.0.0.1:11434/v1" if LLM_PROVIDER == "ollama" else "https://openrouter.ai/api/v1",
+)
+LLM_API_KEY = os.getenv("LLM_API_KEY")
+if not LLM_API_KEY:
+    if LLM_PROVIDER == "ollama":
+        LLM_API_KEY = "ollama"
+    else:
+        LLM_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+if LLM_PROVIDER == "openrouter" and not LLM_API_KEY:
+    print("no api key found. Please set OPENROUTER_API_KEY or LLM_API_KEY in your environment variables.")
+
 
 # Chunking — evidence median=216 chars, p75=383
 CHILD_TARGET_CHARS = 200
@@ -115,6 +123,10 @@ RERANKER_GAP_THRESHOLD = 2.0      # CHANGED: was 5.0 — drop if score gap is la
 
 # Section boosting
 SECTION_BOOST_SCORE = 1.5  # NEW: bonus added to reranker score for matching sections
+
+# Embedding query prefix (model-specific — must match embedding model's training format)
+EMBED_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "  # bge-*
+EMBED_PASSAGE_PREFIX = ""  # bge-* doesn't need passage prefix
 
 # LLM
 MAX_EVIDENCE_FOR_LLM = 5
@@ -413,14 +425,14 @@ class Retriever:
         self.index.add(embs.astype("float32"))
 
         self.bm25 = BM25Okapi([self._tok(t) for t in texts])
-        self.logger.debug(f"[Indexing] {self.index.ntotal} FAISS vectors + BM25 ({len(texts)} docs)")
+        # self.logger.debug(f"[Indexing] {self.index.ntotal} FAISS vectors + BM25 ({len(texts)} docs)")
 
     @staticmethod
     def _tok(text: str) -> list:
         return re.findall(r"\w+", text.lower())
 
     def _embed_query(self, q: str):
-        prefixed = "Represent this sentence for searching relevant passages: " + q
+        prefixed = EMBED_QUERY_PREFIX + q if EMBED_QUERY_PREFIX else q
         return self.embed_model.encode([prefixed], normalize_embeddings=True).astype("float32")
 
     def dense_search(self, query: str, top_k: int) -> list:
@@ -431,7 +443,8 @@ class Retriever:
         return [(int(i), float(s)) for i, s in zip(ids[0], scores[0]) if i >= 0]
 
     def _embed_passage(self, text: str):
-        return self.embed_model.encode([text], normalize_embeddings=True).astype("float32")
+        prefixed = EMBED_PASSAGE_PREFIX + text if EMBED_PASSAGE_PREFIX else text
+        return self.embed_model.encode([prefixed], normalize_embeddings=True).astype("float32")
 
     def hyde_search(self, hyde_text: str, top_k: int) -> list:
         if self.index is None or self.index.ntotal == 0:
@@ -470,10 +483,10 @@ class Retriever:
                 chunk_section = self.chunks[chunk_id].section
                 if chunk_section in target_sections:
                     boosted_scores.append((chunk_id, float(score) + SECTION_BOOST_SCORE))
-                    self.logger.debug(
-                        f"  [SectionBoost] #{chunk_id} ({chunk_section}) "
-                        f"{score:.3f} → {score + SECTION_BOOST_SCORE:.3f}"
-                    )
+                    # self.logger.debug(
+                    #     f"  [SectionBoost] #{chunk_id} ({chunk_section}) "
+                    #     f"{score:.3f} → {score + SECTION_BOOST_SCORE:.3f}"
+                    # )
                 else:
                     boosted_scores.append((chunk_id, float(score)))
             ranked = sorted(boosted_scores, key=lambda x: -x[1])
@@ -546,7 +559,7 @@ class Retriever:
         if not fused:
             return self.chunks[:final_k], {"fallback": True}
 
-        self.logger.debug(f"[RRF] dense_unique={dense_unique}, bm25_unique={bm25_unique}, fused={len(fused)}")
+        # self.logger.debug(f"[RRF] dense_unique={dense_unique}, bm25_unique={bm25_unique}, fused={len(fused)}")
 
         # Stage 3: Cross-encoder reranking with section boosting
         pool_k = min(RERANK_POOL, len(fused))
@@ -605,21 +618,34 @@ class Generator:
             return ""
 
     def generate(self, title: str, question: str, chunks: list, max_retries: int = 5) -> tuple:
-        """Returns (answer_str, debug_info). Uses CoT prompt optimized for Llama-3.2-3B."""
+        """Returns (answer_str, debug_info). Uses few-shot CoT prompt optimized for Llama-3.2-3B."""
 
-        # ── CoT System Prompt optimized for small LLM ──
+        # ── Few-Shot CoT System Prompt ──
         system = (
             "You are a precise scientific paper QA system.\n\n"
             "RULES:\n"
-            "1. Answer ONLY using the evidence passages below. Never use outside knowledge.\n"
-            "2. Think step-by-step: first identify which passage is relevant, then extract the answer.\n"
-            "3. Be concise: 1-3 sentences. Use exact names, numbers, and terms from the evidence.\n"
-            "4. Do NOT start with \"Based on the evidence\" or \"According to the passages\".\n"
-            "5. Do NOT repeat the question.\n\n"
-            "EXAMPLE:\n"
-            "Question: Where does the ancient Chinese dataset come from?\n"
-            "Evidence: To build the large ancient-modern Chinese dataset, we collected 1.7K bilingual ancient-modern Chinese articles from the internet. More specifically, a large part of the ancient Chinese data we used come from ancient Chinese history records in several dynasties (about 1000BC-200BC) and articles written by celebrities of that era.\n"
-            "Answer: ancient Chinese history records in several dynasties (about 1000BC-200BC) and articles written by celebrities of that era"
+            "1. Answer ONLY from the evidence passages. Never use outside knowledge.\n"
+            "2. Use the EXACT words, phrases, names, and numbers from the evidence — do not paraphrase.\n"
+            "3. Be concise: 1-3 sentences max.\n"
+            "4. If the evidence lists multiple items, include ALL of them.\n"
+            "5. Do NOT start with filler like \"Based on the evidence\" or \"According to\".\n\n"
+            "EXAMPLES:\n\n"
+            "Q: Where does the ancient Chinese dataset come from?\n"
+            "Evidence: [1] To build the large ancient-modern Chinese dataset, we collected 1.7K bilingual ancient-modern Chinese articles from the internet. More specifically, a large part of the ancient Chinese data we used come from ancient Chinese history records in several dynasties (about 1000BC-200BC) and articles written by celebrities of that era.\n"
+            "Reasoning: Passage [1] directly states the source. I extract the exact phrase.\n"
+            "Answer: ancient Chinese history records in several dynasties (about 1000BC-200BC) and articles written by celebrities of that era\n\n"
+            "Q: What is the BLEU score of the proposed model on the WMT14 En-De test set?\n"
+            "Evidence: [1] Our model achieves 28.4 BLEU on WMT14 English-to-German and 41.0 BLEU on WMT14 English-to-French, surpassing all previously published models.\n"
+            "Reasoning: The question asks about En-De. Passage [1] states 28.4 BLEU for WMT14 English-to-German.\n"
+            "Answer: 28.4 BLEU\n\n"
+            "Q: What datasets are used for evaluation?\n"
+            "Evidence: [1] We evaluate our approach on three benchmark datasets: SQuAD v1.1, TriviaQA, and Natural Questions (NQ). [2] Additionally, we report results on the MRQA shared task for out-of-domain generalization.\n"
+            "Reasoning: Passages [1] and [2] together list all evaluation datasets.\n"
+            "Answer: SQuAD v1.1, TriviaQA, Natural Questions (NQ), and the MRQA shared task\n\n"
+            "Q: How does the proposed method improve over the baseline?\n"
+            "Evidence: [1] Our method reduces training time by 40% while maintaining comparable accuracy. The key innovation is replacing the attention mechanism with a linear projection layer, which reduces the computational complexity from O(n^2) to O(n).\n"
+            "Reasoning: Passage [1] explains both the improvement (40% training time reduction) and the mechanism.\n"
+            "Answer: It reduces training time by 40% by replacing the attention mechanism with a linear projection layer, reducing computational complexity from O(n^2) to O(n)."
         )
 
         evidence = chunks[:MAX_EVIDENCE_FOR_LLM]
@@ -634,8 +660,8 @@ class Generator:
         user = (
             f"Paper: {title}\n\n"
             f"Evidence passages:\n" + "\n\n".join(ev_lines) + "\n\n"
-            f"Question: {question}\n\n"
-            f"Step-by-step reasoning then answer:"
+            f"Q: {question}\n"
+            f"Reasoning:"
         )
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -661,22 +687,41 @@ class Generator:
                     temperature=LLM_TEMPERATURE,
                     max_tokens=LLM_MAX_TOKENS,
                 )
-                answer = resp.choices[0].message.content.strip()
+                raw_output = (resp.choices[0].message.content or "").strip()
+                answer = raw_output
 
-                # Post-process: if CoT reasoning is present, extract just the answer
-                # Look for common patterns like "Answer:" or the last sentence after reasoning
-                if "\nAnswer:" in answer:
-                    answer = answer.split("\nAnswer:")[-1].strip()
-                elif "\nanswer:" in answer.lower():
-                    parts = re.split(r"\nanswer:", answer, flags=re.IGNORECASE)
-                    answer = parts[-1].strip()
+                reasoning_present = False
+                reasoning_match = re.search(
+                    r"\bReasoning:\s*(.*?)(?:\bAnswer:\s*|$)",
+                    raw_output,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                if reasoning_match and reasoning_match.group(1).strip():
+                    reasoning_present = True
+                else:
+                    answer_split = re.split(r"\bAnswer:\s*", raw_output, maxsplit=1, flags=re.IGNORECASE)
+                    if len(answer_split) == 2 and answer_split[0].strip():
+                        reasoning_present = True
+
+                # Post-process: extract answer after "Answer:" from CoT output
+                # Try multiple patterns to be robust
+                answer_match = re.search(r'\bAnswer:\s*(.+)', answer, re.IGNORECASE | re.DOTALL)
+                if answer_match:
+                    answer = answer_match.group(1).strip()
+                    # If answer still contains reasoning artifacts, take first paragraph
+                    if '\n\n' in answer:
+                        answer = answer.split('\n\n')[0].strip()
+                # Remove trailing "Reasoning:" artifacts if model repeated format
+                answer = re.sub(r'\s*Reasoning:.*$', '', answer, flags=re.DOTALL).strip()
 
                 if resp.usage:
                     debug["actual_prompt_tokens"] = resp.usage.prompt_tokens
                     debug["completion_tokens"] = resp.usage.completion_tokens
                     self.logger.debug(f"[LLM] actual: {resp.usage.prompt_tokens} prompt + "
                                       f"{resp.usage.completion_tokens} completion tokens")
-                self.logger.debug(f"[LLM] answer: {answer}")
+                self.logger.debug(f"[LLM] reasoning_present: {reasoning_present}")
+                self.logger.debug(f"[LLM] raw_output=\n{raw_output}")
+                self.logger.debug(f"[LLM] parsed_answer=\n{answer}")
                 return answer, debug
             except Exception as e:
                 wait = min(2 ** (attempt + 1), 30)
@@ -723,11 +768,21 @@ def generate_query_variants(question: str) -> list:
 # RAG Pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 class RAGPipeline:
-    def __init__(self, api_key: str, logger: logging.Logger):
+    def __init__(
+        self,
+        api_key: str | None,
+        logger: logging.Logger,
+        enable_hyde: bool = True,
+        enable_generation: bool = True,
+    ):
         self.logger = logger
+        self.enable_hyde = enable_hyde
+        self.enable_generation = enable_generation
         self.processor = DocumentProcessor(logger)
         self.retriever = Retriever(logger)
-        self.generator = Generator(api_key=api_key, logger=logger)
+        self.generator = None
+        if self.enable_hyde or self.enable_generation:
+            self.generator = Generator(api_key=api_key or "ollama", logger=logger)
 
     @staticmethod
     def determine_k(question: str) -> int:
@@ -766,11 +821,11 @@ class RAGPipeline:
         t0 = time.time()
         self.retriever.build_index(chunks)
         dt_index = time.time() - t0
-        self.logger.debug(f"[Indexing] done in {dt_index:.2f}s")
+        # self.logger.debug(f"[Indexing] done in {dt_index:.2f}s")
 
         # Stage 3: Query Routing — classify question to target sections
         target_sections = classify_question_sections(question)
-        self.logger.debug(f"[QueryRoute] target_sections={target_sections}")
+        # self.logger.debug(f"[QueryRoute] target_sections={target_sections}")
 
         # Stage 4: Query Variants
         variants = generate_query_variants(question)
@@ -780,9 +835,14 @@ class RAGPipeline:
 
         # Stage 5: HyDE
         t0 = time.time()
-        hyde_text = self.generator.generate_hyde(title, question)
-        dt_hyde = time.time() - t0
-        self.logger.debug(f"[HyDE] generated in {dt_hyde:.2f}s")
+        hyde_text = ""
+        if self.enable_hyde and self.generator is not None:
+            hyde_text = self.generator.generate_hyde(title, question)
+            dt_hyde = time.time() - t0
+            self.logger.debug(f"[HyDE] generated in {dt_hyde:.2f}s")
+        else:
+            dt_hyde = 0.0
+            self.logger.debug("[HyDE] disabled")
 
         # Stage 6: Retrieval with section boosting
         k = self.determine_k(question)
@@ -797,9 +857,14 @@ class RAGPipeline:
 
         # Stage 7: LLM Generation
         t0 = time.time()
-        answer, gen_debug = self.generator.generate(title, question, retrieved)
-        dt_llm = time.time() - t0
-        self.logger.debug(f"[LLM] generated in {dt_llm:.2f}s")
+        if self.enable_generation and self.generator is not None:
+            answer, gen_debug = self.generator.generate(title, question, retrieved)
+            dt_llm = time.time() - t0
+        else:
+            answer, gen_debug = "", {}
+            dt_llm = 0.0
+            self.logger.debug("[LLM] generation disabled")
+        # self.logger.debug(f"[LLM] generated in {dt_llm:.2f}s")
 
         # Stage 8: Cleanup
         self.retriever.clear()
@@ -827,11 +892,11 @@ class RAGPipeline:
             result = self.process_paper(entry)
             results.append(result)
             ans_preview = result.answer[:100].replace("\n", " ")
-            tqdm.write(f"  → {ans_preview}{'...' if len(result.answer) > 100 else ''}")
+            # self.logger.debug(f"  → {ans_preview}")
 
         elapsed = time.time() - t_all
         n = len(dataset)
-        tqdm.write(f"\nDone: {n} papers in {elapsed:.1f}s ({elapsed/n:.1f}s/paper avg)")
+        # tqdm.write(f"\nDone: {n} papers in {elapsed:.1f}s ({elapsed/n:.1f}s/paper avg)")
         return results
 
 
@@ -839,8 +904,9 @@ class RAGPipeline:
 # Evaluator — local ROUGE-L check (matches score_public.py formula exactly)
 # ═══════════════════════════════════════════════════════════════════════════════
 class Evaluator:
-    def __init__(self):
+    def __init__(self, logger=None):
         self.scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+        self.logger = logger
 
     def evidence_score_single(self, retrieved: list, golden: list) -> float:
         if not golden:
@@ -857,6 +923,14 @@ class Evaluator:
         gt_map = {item["title"]: item for item in dataset}
         ev_scores = []
 
+        def log_debug(message: str):
+            if self.logger:
+                self.logger.debug(message)
+
+        log_debug(f"\n{'='*70}")
+        log_debug("  Evidence Score Evaluation (ROUGE-L, same formula as TA)")
+        log_debug(f"{'='*70}")
+
         tqdm.write(f"\n{'='*70}")
         tqdm.write("  Evidence Score Evaluation (ROUGE-L, same formula as TA)")
         tqdm.write(f"{'='*70}")
@@ -864,35 +938,29 @@ class Evaluator:
         for r in results:
             gt = gt_map.get(r.title)
             if gt is None:
-                tqdm.write(f"  [SKIP] {r.title[:50]} — not in ground truth")
+                log_debug(f"  [SKIP] {r.title[:50]} — not in ground truth")
                 continue
             golden_ev = gt.get("evidence", [])
             s = self.evidence_score_single(r.evidence, golden_ev)
             ev_scores.append(s)
-            tqdm.write(f"  {s:.4f}  K={len(r.evidence):>2}  gt_ev={len(golden_ev)}  {r.title[:50]}")
+            log_debug(f"  {s:.4f}  K={len(r.evidence):>2}  gt_ev={len(golden_ev)}  title={r.title[:50]}")
 
         if not ev_scores:
-            tqdm.write("  No papers scored.")
+            log_debug("  No papers scored.")
             return {"mean_evidence_score": 0, "n": 0}
 
         avg = sum(ev_scores) / len(ev_scores)
-        tqdm.write(f"\n  {'─'*60}")
+        log_debug(f"\n  {'─'*60}")
+        log_debug(f"  Mean Evidence Score : {avg:.5f}  (n={len(ev_scores)})")
+        log_debug(f"  {'─'*60}")
+
         tqdm.write(f"  Mean Evidence Score : {avg:.5f}  (n={len(ev_scores)})")
-        tqdm.write(f"  Weak baseline       : 0.2124")
-        tqdm.write(f"  Strong baseline     : 0.26185")
-        if avg > 0.26185:
-            tqdm.write(f"  ✓ Above Strong Baseline!")
-        elif avg > 0.2124:
-            tqdm.write(f"  ✓ Above Weak Baseline")
-        else:
-            tqdm.write(f"  ✗ Below Weak Baseline — needs improvement")
-        tqdm.write(f"  {'─'*60}")
 
         # K distribution stats
         k_values = [len(r.evidence) for r in results if gt_map.get(r.title)]
         if k_values:
             avg_k = sum(k_values) / len(k_values)
-            tqdm.write(f"  Avg K={avg_k:.1f}, min={min(k_values)}, max={max(k_values)}")
+            log_debug(f"  Avg K={avg_k:.1f}, min={min(k_values)}, max={max(k_values)}")
 
         return {"mean_evidence_score": avg, "n": len(ev_scores), "scores": ev_scores}
 
@@ -928,9 +996,9 @@ def main():
 
     output_path = Path(args.output) if args.output else script_dir / f"{STUDENT_ID}.json"
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "ollama")
-    if not api_key:
-        tqdm.write("ERROR: Set OPENROUTER_API_KEY environment variable.")
+    api_key = LLM_API_KEY
+    if LLM_PROVIDER == "openrouter" and not api_key:
+        tqdm.write("ERROR: Set OPENROUTER_API_KEY or LLM_API_KEY environment variable.")
         sys.exit(1)
 
     tqdm.write(f"{'#'*70}")
@@ -940,6 +1008,7 @@ def main():
     tqdm.write(f"  Output   : {output_path}")
     tqdm.write(f"  Log file : {log_path}")
     tqdm.write(f"  Eval mode: {args.eval}  (sample={args.sample if args.sample > 0 else 'all'})")
+    tqdm.write(f"  LLM src  : {LLM_PROVIDER} @ {LLM_BASE_URL}")
     tqdm.write(f"  Embed    : {EMBED_MODEL}")
     tqdm.write(f"  Reranker : {RERANKER_MODEL}")
     tqdm.write(f"  LLM      : {LLM_MODEL}")
@@ -953,6 +1022,7 @@ def main():
     tqdm.write("")
 
     logger.debug(f"Config: embed={EMBED_MODEL}, reranker={RERANKER_MODEL}, llm={LLM_MODEL}")
+    logger.debug(f"LLM transport: provider={LLM_PROVIDER}, base_url={LLM_BASE_URL}")
     logger.debug(f"Chunk: target={CHILD_TARGET_CHARS}, max={CHILD_MAX_CHARS}, "
                  f"parent_window={PARENT_WINDOW_CHUNKS}, parent_max={PARENT_MAX_CHARS}, "
                  f"sentence_overlap={CHUNK_SENTENCE_OVERLAP}")
@@ -997,7 +1067,7 @@ def main():
             tqdm.write("Format validation: PASSED")
 
     if args.eval:
-        evaluator = Evaluator()
+        evaluator = Evaluator(logger=logger)
         evaluator.evaluate(results, dataset)
 
     tqdm.write(f"\nLog saved → {log_path}")
