@@ -8,9 +8,11 @@ For local Ollama, prefix commands with LLM_PROVIDER=ollama
 
 Usage:
   uv run python 111511157.py                                                    # Process private_dataset.json
-  uv run python 111511157.py --eval --output ./public.json                      # Evaluate on public_dataset.json (random sample)
-  uv run python 111511157.py --eval --sample 0 --output ./public.json           # Evaluate all papers (no sampling)
-  uv run python 111511157.py --dataset path.json                                # Custom dataset
+  uv run python 111511157.py --eval                                             # Evaluate on public_dataset.json (writes outputs/public.json)
+  uv run python 111511157.py --eval --sample 0                                  # Evaluate all papers (writes outputs/public.json)
+    
+    --output but forces it into outputs/ folder
+
 """
 
 import argparse
@@ -130,7 +132,7 @@ EMBED_PASSAGE_PREFIX = ""  # bge-* doesn't need passage prefix
 
 # LLM
 MAX_EVIDENCE_FOR_LLM = 5
-LLM_TEMPERATURE = 0.1
+LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 256
 
 # Eval sampling
@@ -581,6 +583,7 @@ class Retriever:
             "rerank_scores": [(i, round(s, 4)) for i, s in reranked],
             "final_k": len(selected),
             "target_sections": list(target_sections) if target_sections else [],
+            "reranked_pool": [self.chunks[i] for i, _ in reranked],  # full reranked pool for LLM context
         }
         return [self.chunks[i] for i, _ in selected], debug
 
@@ -617,51 +620,241 @@ class Generator:
             self.logger.warning(f"[HyDE] Failed: {e}")
             return ""
 
-    def generate(self, title: str, question: str, chunks: list, max_retries: int = 5) -> tuple:
-        """Returns (answer_str, debug_info). Uses few-shot CoT prompt optimized for Llama-3.2-3B."""
+    # ── Question Type Classification ──
+    @staticmethod
+    def classify_question_type(question: str) -> str:
+        q = question.lower().strip()
+        # Check question-word prefix first to avoid false yesno on "How is the..."
+        starts_with_qword = any(q.startswith(w) for w in [
+            "what ", "how ", "why ", "where ", "when ", "who ", "which ",
+            "in what", "to what", "for what",
+        ])
+        if any(kw in q for kw in ["how many", "how much", "what is the size",
+                                   "what is the number", "how long", "how small",
+                                   "how large", "how big", "how often"]):
+            return "number"
+        if any(kw in q for kw in ["what are the", "what were the", "what methods",
+                                   "what techniques", "what datasets", "what approaches",
+                                   "what models", "what features", "what types",
+                                   "which", "what baselines", "what existing",
+                                   "what languages", "what two", "what three",
+                                   "list", "name the", "what metrics",
+                                   "what corpora", "what tasks"]):
+            return "list"
+        # yesno ONLY if question starts with is/are/does/do/can/will etc.
+        if not starts_with_qword and any(kw in q for kw in [
+                "is there", "are there", "does the", "do the",
+                "is the", "can the", "is it", "does it",
+                "do they", "are the", "can it", "will the"]):
+            return "yesno"
+        if any(kw in q for kw in ["why", "what is the reason", "what causes"]):
+            return "reason"
+        if any(kw in q for kw in ["how do", "how does", "how is", "how are", "how to"]):
+            return "method"
+        return "factoid"
 
-        # ── Few-Shot CoT System Prompt ──
+    # ── Span Snapping: map LLM output back to exact evidence text ──
+    @staticmethod
+    def snap_to_evidence_span(answer: str, chunks: list) -> str:
+        """If the LLM paraphrased, find the closest matching span in evidence
+        and replace with the verbatim text. This increases extractive fidelity."""
+        from nltk import sent_tokenize
+
+        if not answer or not chunks or len(answer) < 5:
+            return answer
+
+        # Handle yesno: strip prefix, snap the rest, prepend back
+        yesno_prefix = ""
+        yesno_match = re.match(r'^(Yes|No)[.,;:!\s]+', answer, re.IGNORECASE)
+        if yesno_match:
+            yesno_prefix = yesno_match.group(0)
+            answer_body = answer[len(yesno_prefix):].strip()
+            if answer_body:
+                answer = answer_body
+            else:
+                return answer  # just "Yes" or "No"
+
+        answer_words = set(w.lower() for w in re.findall(r'\b\w{2,}\b', answer))
+        if len(answer_words) < 2:
+            return yesno_prefix + answer if yesno_prefix else answer
+
+        best_span = None
+        best_score = 0.0
+
+        for c in chunks:
+            text = c.parent_text
+            try:
+                sentences = sent_tokenize(text)
+            except Exception:
+                sentences = text.split('. ')
+            if not sentences:
+                continue
+
+            # Try 1-, 2-, and 3-sentence windows
+            for window in range(1, min(4, len(sentences) + 1)):
+                for i in range(len(sentences) - window + 1):
+                    span = " ".join(sentences[i:i + window])
+                    span_words = set(w.lower() for w in re.findall(r'\b\w{2,}\b', span))
+                    if not span_words:
+                        continue
+
+                    overlap = answer_words & span_words
+                    if not overlap:
+                        continue
+                    # Recall: how much of the answer is covered
+                    recall = len(overlap) / len(answer_words)
+                    # Precision: how focused is the span
+                    precision = len(overlap) / len(span_words)
+                    # F1
+                    f1 = (2 * recall * precision) / (recall + precision) if (recall + precision) > 0 else 0
+
+                    # Prefer shorter spans at equal F1 (more precise)
+                    if f1 > best_score or (f1 == best_score and best_span and len(span) < len(best_span)):
+                        best_score = f1
+                        best_span = span
+
+        # Only snap if high confidence match
+        if best_score >= 0.4 and best_span:
+            return yesno_prefix + best_span if yesno_prefix else best_span
+        return yesno_prefix + answer if yesno_prefix else answer
+
+    # ── Answer Post-Processing ──
+    @staticmethod
+    def clean_answer(answer: str, chunks: list) -> str:
+        """Strip meta-commentary, handle IDK, normalize answer."""
+        # 1. Remove meta-commentary prefixes
+        answer = re.sub(
+            r"^(Based on|According to|From|As (stated|mentioned|described|shown) in|"
+            r"The (evidence|passage|paper|text|context) (states|mentions|shows|indicates|describes|suggests) that)"
+            r"\s*(the\s+)?(evidence|passage|paper|text|context)?[^,]*,\s*",
+            "", answer, flags=re.IGNORECASE
+        )
+        # 2. Remove "Passage [N] states that..." references
+        answer = re.sub(
+            r"Passage[s]?\s*\[\d+\](\s*(and|,)\s*(\[\d+\]|Passage\s*\[\d+\]))*\s*"
+            r"(both\s+)?(state|mention|show|indicate|describe|explain|note|say|suggest)s?\s+that\s+",
+            "", answer, flags=re.IGNORECASE
+        )
+        answer = re.sub(r"\bPassage[s]?\s*\[\d+\](\s*(and|,)\s*\[\d+\])*\s*", "", answer)
+        # 3. IDK fallback — replace with first sentence of top chunk
+        idk_patterns = [
+            r"none of the .*(passage|evidence)",
+            r"not (explicitly|specifically|directly) mentioned",
+            r"does(n'?t| not) (mention|contain|include|provide|say|have)",
+            r"no (information|mention|evidence|specific)",
+            r"unable to (find|determine|answer)",
+            r"cannot (find|determine|answer)",
+            r"not (enough|sufficient)",
+            r"i (don'?t|do not|cannot) know",
+        ]
+        if any(re.search(p, answer, re.IGNORECASE) for p in idk_patterns) and chunks:
+            from nltk import sent_tokenize
+            sentences = sent_tokenize(chunks[0].parent_text)
+            if sentences:
+                answer = sentences[0]
+        # 4. If answer is just a table/figure reference, extract surrounding context
+        if chunks and re.match(r"^(Table|Figure|Fig\.)\s*(TABREF|FIGREF)?\d+\.?$", answer.strip(), re.IGNORECASE):
+            from nltk import sent_tokenize
+            sentences = sent_tokenize(chunks[0].parent_text)
+            if sentences:
+                answer = sentences[0]
+        # 5. Remove trailing explanatory clauses
+        answer = re.sub(r"\s*,?\s*as (evidenced|shown|mentioned|stated|described) (by|in).*$",
+                        "", answer, flags=re.IGNORECASE)
+        answer = re.sub(r"\s*,?\s*which (lists?|shows?|indicates?|suggests?|demonstrates?).*$",
+                        "", answer, flags=re.IGNORECASE)
+        # 6. Remove duplicate sentences/phrases
+        parts = re.split(r'[,;]\s*', answer)
+        if len(parts) >= 2:
+            seen = []
+            for p in parts:
+                p_clean = re.sub(r'[.\s]+$', '', p.strip()).lower()
+                if p_clean and p_clean not in [re.sub(r'[.\s]+$', '', s).lower() for s in seen]:
+                    seen.append(p.strip())
+            if seen:
+                answer = ", ".join(seen)
+        # 7. Remove BIBREF markers (noise in extracted answers)
+        # "Word2VecBIBREF16" → "Word2Vec", "BIBREF5, BIBREF6" → ""
+        answer = re.sub(r'\s*BIBREF\d+', '', answer)
+        # Clean up leftover comma chains from removed BIBREFs: ", , ," → ","
+        answer = re.sub(r'(,\s*)+', ', ', answer)
+        answer = re.sub(r'\(\s*,?\s*\)', '', answer)  # empty parens like "(, )"
+        # 8. Fix number formatting: "40, 000" → "40,000", "19, 300" → "19,300"
+        answer = re.sub(r'(\d),\s+(\d{3})', r'\1,\2', answer)
+        # 9. Clean up
+        answer = answer.strip().strip('"').strip("'").strip()
+        answer = re.sub(r'^[,\s]+|[,\s]+$', '', answer)  # trim leading/trailing commas
+        return answer
+
+    def generate(self, title: str, question: str, chunks: list,
+                 extra_chunks: list = None, extra_sentences: list = None,
+                 max_retries: int = 5) -> tuple:
+        """Returns (answer_str, debug_info). Direct extraction prompt for Llama-3.2-3B."""
+
+        # ── Question Type ──
+        q_type = self.classify_question_type(question)
+
+        # ── System Prompt: Direct extraction — short, precise answers ──
+        type_instructions = {
+            "number": "Give the number/quantity with its unit AND surrounding context. Example: '10K user-generated image and textual caption pairs' not just '10K'. Example: '$19,300$ tweets' not just '$19,300$'.",
+            "list": "List ALL items with their FULL names/descriptions as written in the text. Separate with commas. Example: 'Level A: Offensive language Detection, Level B: Categorization of Offensive Language, Level C: Offensive Language Target Identification'.",
+            "yesno": "Start with Yes or No, then give a short reason from the text.",
+            "reason": "Copy the sentence from the text that explains the reason.",
+            "method": "Copy the sentence(s) from the text that describe the method or process.",
+            "factoid": "Copy the relevant sentence or phrase from the text that answers the question. Include full context (e.g. 'roughly 40,000 Manhattan listings' not '40,000').",
+        }
+        type_hint = type_instructions.get(q_type, type_instructions["factoid"])
+
         system = (
-            "You are a precise scientific paper QA system.\n\n"
+            "You are a scientific paper QA system. Extract the answer directly from the provided text.\n\n"
             "RULES:\n"
-            "1. Answer ONLY from the evidence passages. Never use outside knowledge.\n"
-            "2. Use the EXACT words, phrases, names, and numbers from the evidence — do not paraphrase.\n"
-            "3. Be concise: 1-3 sentences max.\n"
-            "4. If the evidence lists multiple items, include ALL of them.\n"
-            "5. Do NOT start with filler like \"Based on the evidence\" or \"According to\".\n\n"
-            "EXAMPLES:\n\n"
-            "Q: Where does the ancient Chinese dataset come from?\n"
-            "Evidence: [1] To build the large ancient-modern Chinese dataset, we collected 1.7K bilingual ancient-modern Chinese articles from the internet. More specifically, a large part of the ancient Chinese data we used come from ancient Chinese history records in several dynasties (about 1000BC-200BC) and articles written by celebrities of that era.\n"
-            "Reasoning: Passage [1] directly states the source. I extract the exact phrase.\n"
-            "Answer: ancient Chinese history records in several dynasties (about 1000BC-200BC) and articles written by celebrities of that era\n\n"
-            "Q: What is the BLEU score of the proposed model on the WMT14 En-De test set?\n"
-            "Evidence: [1] Our model achieves 28.4 BLEU on WMT14 English-to-German and 41.0 BLEU on WMT14 English-to-French, surpassing all previously published models.\n"
-            "Reasoning: The question asks about En-De. Passage [1] states 28.4 BLEU for WMT14 English-to-German.\n"
-            "Answer: 28.4 BLEU\n\n"
-            "Q: What datasets are used for evaluation?\n"
-            "Evidence: [1] We evaluate our approach on three benchmark datasets: SQuAD v1.1, TriviaQA, and Natural Questions (NQ). [2] Additionally, we report results on the MRQA shared task for out-of-domain generalization.\n"
-            "Reasoning: Passages [1] and [2] together list all evaluation datasets.\n"
-            "Answer: SQuAD v1.1, TriviaQA, Natural Questions (NQ), and the MRQA shared task\n\n"
-            "Q: How does the proposed method improve over the baseline?\n"
-            "Evidence: [1] Our method reduces training time by 40% while maintaining comparable accuracy. The key innovation is replacing the attention mechanism with a linear projection layer, which reduces the computational complexity from O(n^2) to O(n).\n"
-            "Reasoning: Passage [1] explains both the improvement (40% training time reduction) and the mechanism.\n"
-            "Answer: It reduces training time by 40% by replacing the attention mechanism with a linear projection layer, reducing computational complexity from O(n^2) to O(n)."
+            "1. COPY the relevant sentence(s) from the text that answer the question. Use the paper's exact wording.\n"
+            "2. Keep the full context: include qualifiers, numbers with units, and descriptive phrases "
+            "'roughly 40,000 Manhattan listings' not '40,000').\n"
+            "3. Answer in 1-2 sentences. No long paragraphs.\n"
+            "4. NEVER say 'Based on', 'According to', 'The paper states', 'Passage [1]'.\n"
+            "5. NEVER add your own explanations or reasoning.\n"
+            "6. If the question asks for a list, include ALL items separated by commas.\n"
+            "7. NEVER say 'not mentioned' or 'I don't know'. Always give the most relevant answer.\n\n"
+            f"FORMAT: {type_hint}"
         )
 
+        # ── Build primary evidence ──
         evidence = chunks[:MAX_EVIDENCE_FOR_LLM]
         ev_lines = []
         total_ev_chars = 0
         for i, c in enumerate(evidence, 1):
-            pt = c.parent_text[:PARENT_MAX_CHARS]
-            section_tag = f" ({c.section})" if c.section and c.section != "unknown" else ""
-            ev_lines.append(f"[{i}]{section_tag} {pt}")
-            total_ev_chars += len(pt)
+            text = c.parent_text[:PARENT_MAX_CHARS]
+            ev_lines.append(f"[{i}] {text}")
+            total_ev_chars += len(text)
+
+        # ── Build supplementary context (extra reranked chunks + keyword sentences) ──
+        supp_lines = []
+        seen_texts = {c.parent_text[:100] for c in evidence}  # dedup against primary evidence
+
+        if extra_chunks:
+            for c in extra_chunks[:6]:
+                key = c.parent_text[:100]
+                if key not in seen_texts:
+                    seen_texts.add(key)
+                    supp_lines.append(c.parent_text[:PARENT_MAX_CHARS])
+
+        if extra_sentences:
+            for sent in extra_sentences:
+                key = sent[:100]
+                if key not in seen_texts:
+                    seen_texts.add(key)
+                    supp_lines.append(sent)
+
+        supp_block = ""
+        if supp_lines:
+            supp_block = "\n\nAdditional context from the paper:\n" + "\n".join(f"- {s}" for s in supp_lines[:8])
 
         user = (
             f"Paper: {title}\n\n"
-            f"Evidence passages:\n" + "\n\n".join(ev_lines) + "\n\n"
-            f"Q: {question}\n"
-            f"Reasoning:"
+            f"Evidence:\n" + "\n\n".join(ev_lines) + supp_block + "\n\n"
+            f"Question: {question}\n"
+            f"Answer:"
         )
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -690,36 +883,25 @@ class Generator:
                 raw_output = (resp.choices[0].message.content or "").strip()
                 answer = raw_output
 
-                reasoning_present = False
-                reasoning_match = re.search(
-                    r"\bReasoning:\s*(.*?)(?:\bAnswer:\s*|$)",
-                    raw_output,
-                    re.IGNORECASE | re.DOTALL,
-                )
-                if reasoning_match and reasoning_match.group(1).strip():
-                    reasoning_present = True
-                else:
-                    answer_split = re.split(r"\bAnswer:\s*", raw_output, maxsplit=1, flags=re.IGNORECASE)
-                    if len(answer_split) == 2 and answer_split[0].strip():
-                        reasoning_present = True
-
-                # Post-process: extract answer after "Answer:" from CoT output
-                # Try multiple patterns to be robust
+                # If model still outputs "Answer:" or "Reasoning:", extract the answer part
                 answer_match = re.search(r'\bAnswer:\s*(.+)', answer, re.IGNORECASE | re.DOTALL)
                 if answer_match:
                     answer = answer_match.group(1).strip()
-                    # If answer still contains reasoning artifacts, take first paragraph
-                    if '\n\n' in answer:
-                        answer = answer.split('\n\n')[0].strip()
-                # Remove trailing "Reasoning:" artifacts if model repeated format
+                # Remove any reasoning artifacts
                 answer = re.sub(r'\s*Reasoning:.*$', '', answer, flags=re.DOTALL).strip()
+                # Take first paragraph if multi-paragraph
+                if '\n\n' in answer:
+                    answer = answer.split('\n\n')[0].strip()
+
+                # Apply answer cleaning pipeline
+                answer = self.clean_answer(answer, chunks)
 
                 if resp.usage:
                     debug["actual_prompt_tokens"] = resp.usage.prompt_tokens
                     debug["completion_tokens"] = resp.usage.completion_tokens
                     self.logger.debug(f"[LLM] actual: {resp.usage.prompt_tokens} prompt + "
                                       f"{resp.usage.completion_tokens} completion tokens")
-                self.logger.debug(f"[LLM] reasoning_present: {reasoning_present}")
+                self.logger.debug(f"[LLM] q_type={q_type}")
                 self.logger.debug(f"[LLM] raw_output=\n{raw_output}")
                 self.logger.debug(f"[LLM] parsed_answer=\n{answer}")
                 return answer, debug
@@ -730,6 +912,74 @@ class Generator:
 
         self.logger.error("[LLM] All retries failed, returning fallback answer.")
         return "Unable to generate answer.", debug
+
+    def generate_fallback(self, title: str, question: str, chunks: list,
+                          extra_chunks: list = None, extra_sentences: list = None) -> tuple:
+        """Fallback generation with a more permissive prompt for IDK recovery."""
+        system = (
+            "Answer the question using information from the text. "
+            "Give a short, direct answer using the exact words from the text. "
+            "Never say 'not mentioned' or 'I don't know'. Always give an answer."
+        )
+        evidence = chunks[:MAX_EVIDENCE_FOR_LLM]
+        ev_lines = [f"[{i}] {c.parent_text[:PARENT_MAX_CHARS]}" for i, c in enumerate(evidence, 1)]
+
+        # Add supplementary context for fallback too
+        supp_lines = []
+        seen_texts = {c.parent_text[:100] for c in evidence}
+        if extra_chunks:
+            for c in extra_chunks[:6]:
+                key = c.parent_text[:100]
+                if key not in seen_texts:
+                    seen_texts.add(key)
+                    supp_lines.append(c.parent_text[:PARENT_MAX_CHARS])
+        if extra_sentences:
+            for sent in extra_sentences:
+                key = sent[:100]
+                if key not in seen_texts:
+                    seen_texts.add(key)
+                    supp_lines.append(sent)
+
+        supp_block = ""
+        if supp_lines:
+            supp_block = "\n\nAdditional context:\n" + "\n".join(f"- {s}" for s in supp_lines[:8])
+
+        user = (
+            f"Paper: {title}\n\n"
+            f"Evidence:\n" + "\n\n".join(ev_lines) + supp_block + "\n\n"
+            f"Question: {question}\n"
+            f"Answer:"
+        )
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        try:
+            resp = self.client.chat.completions.create(
+                model=LLM_MODEL, messages=messages,
+                temperature=0.3, max_tokens=LLM_MAX_TOKENS,
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+            answer_match = re.search(r'\bAnswer:\s*(.+)', answer, re.IGNORECASE | re.DOTALL)
+            if answer_match:
+                answer = answer_match.group(1).strip()
+            answer = self.clean_answer(answer, chunks)
+            self.logger.debug(f"[LLM-fallback] answer={answer}")
+            return answer, {}
+        except Exception as e:
+            self.logger.warning(f"[LLM-fallback] Error: {e}")
+            return "", {}
+
+    # ── IDK detection ──
+    _IDK_PATTERNS = [
+        "none of the", "not mentioned", "not explicitly",
+        "does not mention", "doesn't mention", "does not contain",
+        "no information", "unable to", "cannot find", "not enough",
+        "not specifically", "not directly", "no specific",
+        "doesn't provide", "does not provide", "not provided",
+    ]
+
+    @classmethod
+    def is_idk(cls, answer: str) -> bool:
+        a = answer.lower()
+        return any(p in a for p in cls._IDK_PATTERNS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -762,6 +1012,46 @@ def generate_query_variants(question: str) -> list:
         variants.append(" ".join(kw))
 
     return variants[:3]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Keyword Sentence Extraction — supplementary LLM context from full_text
+# ═══════════════════════════════════════════════════════════════════════════════
+_KW_STOP = frozenset(
+    "what which how why where when who whom whose is are was were do does did "
+    "the a an and or but in on at to for of with from by as not this that "
+    "these those it its they them their has have had can could would should "
+    "will may must shall be been being about also more than some other used using "
+    "paper model method approach".split()
+)
+
+
+def extract_keyword_sentences(full_text: str, question: str, max_sentences: int = 8) -> list[str]:
+    """Find sentences in full_text matching question keywords (BM25-like sentence retrieval)."""
+    keywords = [w.lower() for w in re.findall(r"\b[a-zA-Z]{3,}\b", question) if w.lower() not in _KW_STOP]
+    if not keywords:
+        return []
+    sentences = nltk.sent_tokenize(full_text)
+    scored = []
+    for sent in sentences:
+        if len(sent) < 20 or len(sent) > 500:
+            continue
+        sent_lower = sent.lower()
+        score = sum(1 for kw in keywords if kw in sent_lower)
+        if score > 0:
+            scored.append((score, sent))
+    scored.sort(key=lambda x: -x[0])
+    # Deduplicate near-identical sentences
+    seen = set()
+    result = []
+    for _, sent in scored:
+        key = sent[:60].lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(sent)
+        if len(result) >= max_sentences:
+            break
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -855,22 +1145,44 @@ class RAGPipeline:
         dt_retrieval = time.time() - t0
         self.logger.debug(f"[Retrieval] K={k}, got {len(retrieved)} chunks in {dt_retrieval:.2f}s")
 
-        # Stage 7: LLM Generation
+        # Stage 6b: Build expanded LLM context (decoupled from evidence output)
+        # Evidence output stays as top-k for scoring; LLM gets extra context for better answers
+        reranked_pool = retrieval_debug.get("reranked_pool", retrieved)
+        kw_sentences = extract_keyword_sentences(full_text, question, max_sentences=8)
+        self.logger.debug(f"[LLM Context] reranked_pool={len(reranked_pool)}, kw_sentences={len(kw_sentences)}")
+
+        # Stage 7: LLM Generation with expanded context
         t0 = time.time()
         if self.enable_generation and self.generator is not None:
-            answer, gen_debug = self.generator.generate(title, question, retrieved)
+            answer, gen_debug = self.generator.generate(
+                title, question, retrieved,
+                extra_chunks=reranked_pool[len(retrieved):],
+                extra_sentences=kw_sentences,
+            )
+            # Stage 7b: IDK Recovery — retry with permissive prompt if answer is uncertain
+            if Generator.is_idk(answer):
+                self.logger.debug(f"[IDK Recovery] Detected IDK answer, retrying with fallback prompt")
+                retry_answer, _ = self.generator.generate_fallback(
+                    title, question, retrieved,
+                    extra_chunks=reranked_pool[len(retrieved):],
+                    extra_sentences=kw_sentences,
+                )
+                if retry_answer and not Generator.is_idk(retry_answer):
+                    answer = retry_answer
+                    self.logger.debug(f"[IDK Recovery] Recovered: {answer[:100]}")
+                else:
+                    self.logger.debug(f"[IDK Recovery] Fallback also failed, keeping original")
             dt_llm = time.time() - t0
         else:
             answer, gen_debug = "", {}
             dt_llm = 0.0
             self.logger.debug("[LLM] generation disabled")
-        # self.logger.debug(f"[LLM] generated in {dt_llm:.2f}s")
 
         # Stage 8: Cleanup
         self.retriever.clear()
 
         total_time = time.time() - t_start
-        evidence = [c.text for c in retrieved]
+        evidence = [c.text for c in retrieved]  # evidence output unchanged
 
         self.logger.debug(f"[Result] answer ({len(answer)} chars): {answer}")
         self.logger.debug(f"[Result] evidence: {len(evidence)} chunks, sections={[c.section for c in retrieved]}")
@@ -994,7 +1306,16 @@ def main():
         if not dataset_path.exists():
             dataset_path = script_dir / "datasets" / "private_dataset.json"
 
-    output_path = Path(args.output) if args.output else script_dir / f"{STUDENT_ID}.json"
+    if args.eval:
+        if args.output:
+            # --eval respects --output but forces it into outputs/ folder
+            out_name = Path(args.output).name
+            output_path = script_dir / "outputs" / out_name
+        else:
+            output_path = script_dir / "outputs" / "public.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output_path = Path(args.output) if args.output else script_dir / f"{STUDENT_ID}.json"
 
     api_key = LLM_API_KEY
     if LLM_PROVIDER == "openrouter" and not api_key:
@@ -1002,8 +1323,10 @@ def main():
         sys.exit(1)
 
     tqdm.write(f"{'#'*70}")
-    tqdm.write(f"# HW2 RAG Pipeline v2 (Optimized) — Student {STUDENT_ID}")
+    tqdm.write(f"# HW2 RAG")
     tqdm.write(f"{'#'*70}")
+    if args.eval and args.output:
+        tqdm.write(f"  Note     : --eval writes to outputs/ folder → {output_path}")
     tqdm.write(f"  Dataset  : {dataset_path}")
     tqdm.write(f"  Output   : {output_path}")
     tqdm.write(f"  Log file : {log_path}")
@@ -1045,12 +1368,12 @@ def main():
     pipeline = RAGPipeline(api_key=api_key, logger=logger)
     results = pipeline.run(dataset)
 
-    if not args.eval:
-        output = [{"title": r.title, "answer": r.answer, "evidence": r.evidence} for r in results]
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
-        tqdm.write(f"\nSaved {len(output)} results → {output_path}")
+    output = [{"title": r.title, "answer": r.answer, "evidence": r.evidence} for r in results]
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+    tqdm.write(f"\nSaved {len(output)} results → {output_path}")
 
+    if not args.eval:
         errors = []
         for r in output:
             if not isinstance(r["answer"], str) or not r["answer"].strip():
