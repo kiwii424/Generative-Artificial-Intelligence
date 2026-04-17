@@ -82,8 +82,9 @@ def setup_logging(log_dir: Path) -> logging.Logger:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
-EMBED_MODEL = "BAAI/bge-large-en-v1.5"
+EMBED_MODEL = "Snowflake/snowflake-arctic-embed-l-v2.0"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
 LLM_MODEL = os.getenv(
     "LLM_MODEL",
@@ -106,18 +107,18 @@ if LLM_PROVIDER == "openrouter" and not LLM_API_KEY:
 
 # Chunking — evidence median=216 chars, p75=383
 CHILD_TARGET_CHARS = 200
-CHILD_MAX_CHARS = 400
+CHILD_MAX_CHARS = 350
 PARENT_WINDOW_CHUNKS = 2
-PARENT_MAX_CHARS = 800
-CHUNK_SENTENCE_OVERLAP = 1  # NEW: 1-sentence overlap between consecutive chunks
+CHUNK_SENTENCE_OVERLAP = 2  # NEW: 1-sentence overlap between consecutive chunks
+PARENT_MAX_CHARS = 1200       # REVERTED: 800 truncated golden evidence text
 
 # Retrieval
-DENSE_TOP_K = 40
-BM25_TOP_K = 40
-RRF_TOP_K = 20
+DENSE_TOP_K = 60              # CHANGED: was 40, wider net catches more candidates
+BM25_TOP_K = 60              # CHANGED: was 40
+RRF_TOP_K = 30               # CHANGED: was 20, more candidates for reranking
 RRF_K = 60
-DEFAULT_FINAL_K = 2          # CHANGED: was 3, reduced to avoid filler evidence
-RERANK_POOL = 15
+DEFAULT_FINAL_K = 1
+RERANK_POOL = 30             # CHANGED: was 20, deeper reranking pool
 
 # Dynamic K selection — TIGHTENED significantly
 RERANKER_SCORE_THRESHOLD = 0.0    # CHANGED: was -1.0 — only keep positively-scored chunks
@@ -128,12 +129,15 @@ SECTION_BOOST_SCORE = 1.5  # NEW: bonus added to reranker score for matching sec
 
 # Embedding query prefix (model-specific — must match embedding model's training format)
 EMBED_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "  # bge-*
-EMBED_PASSAGE_PREFIX = ""  # bge-* doesn't need passage prefix
+EMBED_PASSAGE_PREFIX = ""  # Snowflake arctic-embed: no passage prefix needed
 
 # LLM
 MAX_EVIDENCE_FOR_LLM = 5
+LLM_CONTEXT_K = 5            # CHANGED: was 20, reduced — 3B model works best with focused context
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 256
+SC_VOTES = 1                 # CHANGED: was 3, disabled — didn't prove a win, triples API calls
+SC_TEMPERATURE = 0.3         # Temperature for voting runs (0.0 for first, SC_TEMP for rest)
 
 # Eval sampling
 EVAL_SAMPLE_N = 20
@@ -532,6 +536,152 @@ class Retriever:
         self.logger.debug(f"[DynamicK] max_k={max_k}, selected={len(selected)}")
         return selected
 
+    def refine_evidence(self, question: str, reranked_pool: list, full_text: str,
+                        max_k: int = 1, logger=None) -> list[str]:
+        """
+        Sentence-level evidence refinement for higher ROUGE-L.
+
+        Instead of submitting whole chunks (~200 chars with arbitrary boundaries),
+        extract individual sentences and multi-sentence windows from the top reranked
+        chunks + keyword-matched sentences, re-score them with the cross-encoder,
+        and return the best non-overlapping spans.
+
+        This dramatically improves ROUGE-L because golden evidence is typically
+        1-3 exact sentences from the paper.
+        """
+        candidates = []
+        seen_keys = set()
+
+        def _clean_evidence_text(text):
+            """Strip section headers and reference markers from evidence spans."""
+            # Remove section header prefixes like "Abstract\n", "Conclusions\n", "Datasets :::\n"
+            text = re.sub(r'^(?:Abstract|Introduction|Conclusions?|Related Work|Discussion|'
+                          r'Results?|Methods?|Experiments?|Background|Evaluation)\s*\n',
+                          '', text, flags=re.IGNORECASE)
+            # Remove "Section ::: Subsection\n" style headers
+            text = re.sub(r'^[A-Z][^\n]{0,60}(?:\s*:::)+[^\n]*\n', '', text)
+            # Remove reference markers
+            text = re.sub(r'\s*BIBREF\d+', '', text)
+            text = re.sub(r'(?:Section\s+)?SECREF\d+', '', text)
+            text = re.sub(r'(?:Table\s+)?TABREF\d+', 'the table', text)
+            text = re.sub(r'(?:Figure\s+)?FIGREF\d+', 'the figure', text)
+            text = re.sub(r'INLINEFORM\d+', '', text)
+            text = re.sub(r'DISPLAYFORM\d+', '', text)
+            text = re.sub(r'\(\s*,?\s*\)', '', text)
+            text = re.sub(r'(,\s*)+', ', ', text)
+            text = re.sub(r'§\s*', '', text)
+            return text.strip()
+
+        def _add(text):
+            text = _clean_evidence_text(text)
+            if len(text) < 15 or len(text) > 700:
+                return
+            key = text[:60].lower()
+            if key not in seen_keys:
+                seen_keys.add(key)
+                candidates.append(text)
+
+        # Source 1: Sentences + sliding windows from top reranked chunks' parent text
+        for chunk in reranked_pool[:15]:  # CHANGED: was 8, deeper search
+            # Also add the raw child chunk text as a candidate
+            _add(chunk.text)
+            try:
+                sents = nltk.sent_tokenize(chunk.parent_text)
+            except Exception:
+                sents = chunk.parent_text.split('. ')
+            for i, sent in enumerate(sents):
+                _add(sent)
+                # 2-sentence window (golden evidence often spans 2 sentences)
+                if i + 1 < len(sents):
+                    _add(sent.strip() + ' ' + sents[i + 1].strip())
+                # 3-sentence window
+                if i + 2 < len(sents):
+                    _add(' '.join(s.strip() for s in sents[i:i + 3]))
+
+        # Source 2: Full-text sentence search — catches evidence that retrieval missed entirely
+        # Golden evidence can be ANY sentence in the paper; chunk-based retrieval misses ~50% of them
+        try:
+            all_sents = nltk.sent_tokenize(full_text)
+        except Exception:
+            all_sents = full_text.split('. ')
+
+        # Score all sentences by keyword overlap with question
+        q_keywords = set(w.lower() for w in re.findall(r'\b[a-zA-Z]{3,}\b', question)
+                        if w.lower() not in {'the', 'this', 'that', 'what', 'which', 'how',
+                                            'does', 'did', 'are', 'was', 'were', 'been',
+                                            'have', 'has', 'had', 'for', 'with', 'from',
+                                            'they', 'their', 'there', 'used', 'using',
+                                            'paper'})
+        for i, sent in enumerate(all_sents):
+            if len(sent) < 20 or len(sent) > 500:
+                continue
+            sent_lower = sent.lower()
+            hit_count = sum(1 for kw in q_keywords if kw in sent_lower)
+            if hit_count >= 2:  # at least 2 keyword matches
+                _add(sent)
+                # 2-sentence window
+                if i + 1 < len(all_sents):
+                    _add(sent.strip() + ' ' + all_sents[i + 1].strip())
+
+        # Source 3: Keyword-matched sentences (legacy, may overlap with source 2 — dedup handles it)
+        kw_sents = extract_keyword_sentences(full_text, question, max_sentences=20)
+        for sent in kw_sents:
+            _add(sent)
+
+        if not candidates:
+            return [reranked_pool[0].text] if reranked_pool else [""]
+
+        # Score ALL candidates with cross-encoder reranker (one batch call)
+        pairs = [(question, c) for c in candidates]
+        scores = self.reranker.predict(pairs, show_progress_bar=False)
+        scored = sorted(
+            zip(candidates, [float(s) for s in scores]),
+            key=lambda x: -x[1]
+        )
+
+        if logger:
+            top_n = min(5, len(scored))
+            logger.debug(f"[RefineEvidence] {len(candidates)} candidates, "
+                         f"top scores: {[f'{s:.3f}' for _, s in scored[:top_n]]}")
+
+        # Select non-overlapping top spans with quality gating
+        selected = []
+        top_score = scored[0][1] if scored else 0
+
+        for text, score in scored:
+            # Quality gate: stricter threshold for 2nd+ evidence piece
+            # (scoring formula divides by K — filler evidence kills score)
+            if selected:
+                if score < 0.5:  # Strict: 2nd evidence must be confidently relevant
+                    break
+                if top_score > 0 and score < top_score * 0.4:
+                    break
+
+            # Overlap check: skip if too similar to already-selected spans
+            overlap = False
+            for s in selected:
+                if text in s or s in text:
+                    overlap = True
+                    break
+                w1 = set(text.lower().split())
+                w2 = set(s.lower().split())
+                denom = min(len(w1), len(w2))
+                if denom > 0 and len(w1 & w2) / denom > 0.6:
+                    overlap = True
+                    break
+
+            if not overlap:
+                selected.append(text)
+            if len(selected) >= max_k:
+                break
+
+        if logger:
+            logger.debug(f"[RefineEvidence] selected {len(selected)} evidence spans")
+            for i, s in enumerate(selected):
+                logger.debug(f"  EV[{i}]: {s[:150]}")
+
+        return selected if selected else [reranked_pool[0].text]
+
     def retrieve(self, question: str, variants: list, final_k: int,
                  hyde_text: str = "", target_sections: set = None) -> tuple:
         """Full pipeline: multi-query dense+BM25 (+HyDE) → RRF → section-boosted rerank → dynamic-K."""
@@ -713,7 +863,7 @@ class Generator:
                         best_score = f1
                         best_span = span
 
-        # Only snap if high confidence match
+        # Snap if reasonable match — threshold balances extractive fidelity vs wrong snaps
         if best_score >= 0.4 and best_span:
             return yesno_prefix + best_span if yesno_prefix else best_span
         return yesno_prefix + answer if yesno_prefix else answer
@@ -722,6 +872,23 @@ class Generator:
     @staticmethod
     def clean_answer(answer: str, chunks: list) -> str:
         """Strip meta-commentary, handle IDK, normalize answer."""
+        # 0. Remove "Here are..." / "Here is..." meta-commentary headers
+        #    These are the #1 source of 0-score answers (22/100 in latest run)
+        answer = re.sub(
+            r"^Here (are|is) .{0,150}?[:\n]+\s*",
+            "", answer, flags=re.IGNORECASE
+        )
+        # Also: "The answer is:", "The answer to the question is:"
+        answer = re.sub(
+            r"^The answer( to .{0,80}?)?\s*(is|would be)[:\s]+",
+            "", answer, flags=re.IGNORECASE
+        )
+        # 0b. If stripping left us empty, fallback to top chunk sentence
+        if not answer.strip() and chunks:
+            from nltk import sent_tokenize
+            sentences = sent_tokenize(chunks[0].parent_text)
+            if sentences:
+                answer = sentences[0]
         # 1. Remove meta-commentary prefixes
         answer = re.sub(
             r"^(Based on|According to|From|As (stated|mentioned|described|shown) in|"
@@ -763,63 +930,43 @@ class Generator:
                         "", answer, flags=re.IGNORECASE)
         answer = re.sub(r"\s*,?\s*which (lists?|shows?|indicates?|suggests?|demonstrates?).*$",
                         "", answer, flags=re.IGNORECASE)
-        # 6. Remove duplicate sentences/phrases
-        parts = re.split(r'[,;]\s*', answer)
-        if len(parts) >= 2:
-            seen = []
-            for p in parts:
-                p_clean = re.sub(r'[.\s]+$', '', p.strip()).lower()
-                if p_clean and p_clean not in [re.sub(r'[.\s]+$', '', s).lower() for s in seen]:
-                    seen.append(p.strip())
-            if seen:
-                answer = ", ".join(seen)
-        # 7. Remove BIBREF markers (noise in extracted answers)
-        # "Word2VecBIBREF16" → "Word2Vec", "BIBREF5, BIBREF6" → ""
+        # 6. Remove duplicate sentences (sentence-level dedup, not comma-splitting)
+        from nltk import sent_tokenize
+        try:
+            sents = sent_tokenize(answer)
+        except Exception:
+            sents = [answer]
+        if len(sents) >= 2:
+            seen_normalized = []
+            deduped = []
+            for s in sents:
+                norm = re.sub(r'[.\s]+$', '', s.strip()).lower()
+                if norm and norm not in seen_normalized:
+                    seen_normalized.append(norm)
+                    deduped.append(s.strip())
+            if deduped:
+                answer = " ".join(deduped)
+        # 7. Remove paper reference markers (noise in extracted answers)
         answer = re.sub(r'\s*BIBREF\d+', '', answer)
-        # Clean up leftover comma chains from removed BIBREFs: ", , ," → ","
+        answer = re.sub(r'(?:Section\s+)?SECREF\d+', '', answer)
+        answer = re.sub(r'(?:Table\s+)?TABREF\d+', 'the table', answer)
+        answer = re.sub(r'(?:Figure\s+)?FIGREF\d+', 'the figure', answer)
+        answer = re.sub(r'INLINEFORM\d+', '', answer)
+        answer = re.sub(r'DISPLAYFORM\d+', '', answer)
         answer = re.sub(r'(,\s*)+', ', ', answer)
-        answer = re.sub(r'\(\s*,?\s*\)', '', answer)  # empty parens like "(, )"
+        answer = re.sub(r'\(\s*,?\s*\)', '', answer)
+        answer = re.sub(r'§\s*', '', answer)
         # 8. Fix number formatting: "40, 000" → "40,000", "19, 300" → "19,300"
         answer = re.sub(r'(\d),\s+(\d{3})', r'\1,\2', answer)
         # 9. Clean up
         answer = answer.strip().strip('"').strip("'").strip()
-        answer = re.sub(r'^[,\s]+|[,\s]+$', '', answer)  # trim leading/trailing commas
+        answer = re.sub(r'^[,\s]+|[,\s]+$', '', answer)
         return answer
 
-    def generate(self, title: str, question: str, chunks: list,
-                 extra_chunks: list = None, extra_sentences: list = None,
-                 max_retries: int = 5) -> tuple:
-        """Returns (answer_str, debug_info). Direct extraction prompt for Llama-3.2-3B."""
-
-        # ── Question Type ──
-        q_type = self.classify_question_type(question)
-
-        # ── System Prompt: Direct extraction — short, precise answers ──
-        type_instructions = {
-            "number": "Give the number/quantity with its unit AND surrounding context. Example: '10K user-generated image and textual caption pairs' not just '10K'. Example: '$19,300$ tweets' not just '$19,300$'.",
-            "list": "List ALL items with their FULL names/descriptions as written in the text. Separate with commas. Example: 'Level A: Offensive language Detection, Level B: Categorization of Offensive Language, Level C: Offensive Language Target Identification'.",
-            "yesno": "Start with Yes or No, then give a short reason from the text.",
-            "reason": "Copy the sentence from the text that explains the reason.",
-            "method": "Copy the sentence(s) from the text that describe the method or process.",
-            "factoid": "Copy the relevant sentence or phrase from the text that answers the question. Include full context (e.g. 'roughly 40,000 Manhattan listings' not '40,000').",
-        }
-        type_hint = type_instructions.get(q_type, type_instructions["factoid"])
-
-        system = (
-            "You are a scientific paper QA system. Extract the answer directly from the provided text.\n\n"
-            "RULES:\n"
-            "1. COPY the relevant sentence(s) from the text that answer the question. Use the paper's exact wording.\n"
-            "2. Keep the full context: include qualifiers, numbers with units, and descriptive phrases "
-            "'roughly 40,000 Manhattan listings' not '40,000').\n"
-            "3. Answer in 1-2 sentences. No long paragraphs.\n"
-            "4. NEVER say 'Based on', 'According to', 'The paper states', 'Passage [1]'.\n"
-            "5. NEVER add your own explanations or reasoning.\n"
-            "6. If the question asks for a list, include ALL items separated by commas.\n"
-            "7. NEVER say 'not mentioned' or 'I don't know'. Always give the most relevant answer.\n\n"
-            f"FORMAT: {type_hint}"
-        )
-
-        # ── Build primary evidence ──
+    def _build_llm_context(self, chunks: list, extra_chunks: list = None,
+                           extra_sentences: list = None) -> tuple:
+        """Build evidence lines and supplementary context for LLM prompt.
+        Returns (ev_lines, supp_block, total_ev_chars)."""
         evidence = chunks[:MAX_EVIDENCE_FOR_LLM]
         ev_lines = []
         total_ev_chars = 0
@@ -828,12 +975,12 @@ class Generator:
             ev_lines.append(f"[{i}] {text}")
             total_ev_chars += len(text)
 
-        # ── Build supplementary context (extra reranked chunks + keyword sentences) ──
+        # Supplementary context from extra reranked chunks + keyword sentences
         supp_lines = []
-        seen_texts = {c.parent_text[:100] for c in evidence}  # dedup against primary evidence
+        seen_texts = {c.parent_text[:100] for c in evidence}
 
         if extra_chunks:
-            for c in extra_chunks[:6]:
+            for c in extra_chunks[:LLM_CONTEXT_K - len(evidence)]:
                 key = c.parent_text[:100]
                 if key not in seen_texts:
                     seen_texts.add(key)
@@ -848,12 +995,84 @@ class Generator:
 
         supp_block = ""
         if supp_lines:
-            supp_block = "\n\nAdditional context from the paper:\n" + "\n".join(f"- {s}" for s in supp_lines[:8])
+            supp_block = "\n\nAdditional context from the paper:\n" + "\n".join(
+                f"- {s}" for s in supp_lines[:8])
+
+        return ev_lines, supp_block, total_ev_chars
+
+    def _parse_raw_answer(self, raw_output: str, chunks: list) -> str:
+        """Parse and clean a single LLM raw output into a clean answer."""
+        answer = raw_output
+        # Extract answer part if model outputs "Answer:" or "Reasoning:"
+        answer_match = re.search(r'\bAnswer:\s*(.+)', answer, re.IGNORECASE | re.DOTALL)
+        if answer_match:
+            answer = answer_match.group(1).strip()
+        answer = re.sub(r'\s*Reasoning:.*$', '', answer, flags=re.DOTALL).strip()
+        if '\n\n' in answer:
+            answer = answer.split('\n\n')[0].strip()
+        answer = self.clean_answer(answer, chunks)
+        return answer
+
+    def _score_extractiveness(self, answer: str, chunks: list) -> float:
+        """Score how extractive an answer is (word overlap with evidence text)."""
+        if not answer or not chunks:
+            return 0.0
+        answer_words = set(w.lower() for w in re.findall(r'\b\w{3,}\b', answer))
+        if not answer_words:
+            return 0.0
+        evidence_words = set()
+        for c in chunks[:MAX_EVIDENCE_FOR_LLM]:
+            evidence_words.update(w.lower() for w in re.findall(r'\b\w{3,}\b', c.parent_text))
+        if not evidence_words:
+            return 0.0
+        return len(answer_words & evidence_words) / len(answer_words)
+
+    def generate(self, title: str, question: str, chunks: list,
+                 extra_chunks: list = None, extra_sentences: list = None,
+                 max_retries: int = 5) -> tuple:
+        """Returns (answer_str, debug_info). Self-consistency voting for Llama-3.2-3B."""
+
+        # ── Question Type ──
+        q_type = self.classify_question_type(question)
+
+        # ── System Prompt: Detailed with examples (3B needs examples) ──
+        type_instructions = {
+            "number": "Find the EXACT number/quantity in the text. Copy the full phrase including the number with its unit and surrounding noun. Example: '$0.3$ million records' not just '0.3 million'. Example: 'roughly 40,000 Manhattan listings' not just '40,000'.",
+            "list": "List ALL specific items by their exact names from the text, separated by commas. Example: 'Level A: Offensive language Detection, Level B: Categorization of Offensive Language, Level C: Offensive Language Target Identification'. Example: 'BiLSTM, BiLSTM+CNN, BiLSTM+CRF, BiLSTM+CNN+CRF, CNN, Stanford CRF'.",
+            "yesno": "Start with Yes or No, then copy the sentence from the text that supports your answer.",
+            "reason": "Copy the sentence from the text that explains the reason. Do NOT paraphrase.",
+            "method": "Copy the sentence(s) from the text that describe the specific method, technique, or process.",
+            "factoid": "Copy the specific phrase or sentence from the text that directly answers the question. Be precise — include the specific names, numbers, or details asked about.",
+        }
+        type_hint = type_instructions.get(q_type, type_instructions["factoid"])
+
+        system = (
+            "You are an extractive QA system for scientific papers. Your job is to find and COPY the exact answer from the text.\n\n"
+            "CRITICAL RULES:\n"
+            "1. Find the sentence(s) that DIRECTLY answer the question and COPY them verbatim.\n"
+            "2. Do NOT copy sentences that merely RESTATE or INTRODUCE the topic. "
+            "For example, if the question is 'What is the core component for KBQA?', do NOT answer 'Relation detection is a core component for KBQA.' — "
+            "instead find the sentence that describes WHAT that component IS or HOW it works.\n"
+            "3. Be SPECIFIC: if the question asks 'what model?', give the model NAME (e.g. 'BERTbase'), not a description like 'a transformer model'.\n"
+            "4. If the question asks 'how many/what size?', give the EXACT number with context (e.g. '$0.3$ million records').\n"
+            "5. If the question asks for a list, list ALL specific items by name.\n"
+            "6. Answer in 1-2 sentences maximum. Do NOT write paragraphs.\n"
+            "7. NEVER start with 'Based on', 'According to', 'The paper states', 'The answer is', 'Here are', 'We', 'In this paper'.\n"
+            "8. NEVER paraphrase or explain — just copy the relevant text.\n"
+            "9. NEVER say 'not mentioned' or 'I don't know'.\n"
+            "10. NEVER echo the question back. Start directly with the specific answer content.\n\n"
+            f"FORMAT: {type_hint}"
+        )
+
+        # ── Build LLM context: focused, high-quality parent chunks ──
+        ev_lines, supp_block, total_ev_chars = self._build_llm_context(
+            chunks, extra_chunks, extra_sentences)
 
         user = (
             f"Paper: {title}\n\n"
             f"Evidence:\n" + "\n\n".join(ev_lines) + supp_block + "\n\n"
             f"Question: {question}\n"
+            f"Find the specific answer in the evidence above. Copy the exact words.\n"
             f"Answer:"
         )
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -861,88 +1080,126 @@ class Generator:
         prompt_chars = len(system) + len(user)
         est_tokens = prompt_chars // 4
 
-        self.logger.debug(f"[LLM] n_evidence={len(evidence)}, ev_chars={total_ev_chars}, "
+        self.logger.debug(f"[LLM] n_evidence={len(ev_lines)}, ev_chars={total_ev_chars}, "
                           f"prompt_chars={prompt_chars}, est_tokens={est_tokens}")
-        self.logger.debug(f"[LLM] prompt_user=\n{user}")
 
         debug = {
-            "n_evidence_for_llm": len(evidence),
+            "n_evidence_for_llm": len(ev_lines),
             "evidence_total_chars": total_ev_chars,
             "prompt_chars": prompt_chars,
             "est_prompt_tokens": est_tokens,
         }
 
-        for attempt in range(max_retries):
+        # ── Self-Consistency Voting: generate N times, pick most extractive ──
+        candidates = []
+        temperatures = [LLM_TEMPERATURE] + [SC_TEMPERATURE] * (SC_VOTES - 1)
+
+        for vote_idx, temp in enumerate(temperatures):
+            for attempt in range(max_retries):
+                try:
+                    resp = self.client.chat.completions.create(
+                        model=LLM_MODEL,
+                        messages=messages,
+                        temperature=temp,
+                        max_tokens=LLM_MAX_TOKENS,
+                    )
+                    raw_output = (resp.choices[0].message.content or "").strip()
+                    answer = self._parse_raw_answer(raw_output, chunks)
+
+                    if vote_idx == 0 and resp.usage:
+                        debug["actual_prompt_tokens"] = resp.usage.prompt_tokens
+                        debug["completion_tokens"] = resp.usage.completion_tokens
+
+                    self.logger.debug(f"[LLM] vote {vote_idx}: q_type={q_type}, raw={raw_output[:150]}")
+                    self.logger.debug(f"[LLM] vote {vote_idx}: parsed={answer[:150]}")
+                    candidates.append(answer)
+                    break
+                except Exception as e:
+                    wait = min(2 ** (attempt + 1), 30)
+                    self.logger.warning(f"[LLM] Error (vote {vote_idx}, attempt {attempt+1}): {e}")
+                    time.sleep(wait)
+
+        if not candidates:
+            self.logger.error("[LLM] All votes failed, returning fallback answer.")
+            return "Unable to generate answer.", debug
+
+        # Pick the best candidate: highest extractive overlap with evidence
+        if len(candidates) == 1:
+            best = candidates[0]
+        else:
+            scored = [(c, self._score_extractiveness(c, chunks)) for c in candidates]
+            scored.sort(key=lambda x: -x[1])
+            best = scored[0][0]
+            self.logger.debug(f"[SC] {len(candidates)} candidates, "
+                              f"scores={[f'{s:.2f}' for _, s in scored]}, "
+                              f"picked: {best[:100]}")
+
+        # ── Anti-Echo Retry: if answer echoes the question, retry with stronger prompt ──
+        if self.is_echo(best, question):
+            self.logger.debug(f"[AntiEcho] detected echo, retrying with targeted prompt")
+            anti_echo_system = (
+                "You are answering a question about a scientific paper. "
+                "The previous answer was wrong because it just restated the question instead of answering it.\n\n"
+                "IMPORTANT: Do NOT repeat the question. Find the SPECIFIC answer in the text.\n"
+                f"- Question type: {q_type}\n"
+                f"- {type_hint}\n\n"
+                "Look for sentences that contain specific names, numbers, methods, or results — NOT sentences that introduce or describe the topic."
+            )
+            anti_echo_user = (
+                f"Paper: {title}\n\n"
+                f"Evidence:\n" + "\n\n".join(ev_lines) + supp_block + "\n\n"
+                f"Question: {question}\n"
+                f"BAD answer (just restates the question): {best}\n"
+                f"Find the REAL answer from the evidence. Copy the exact text.\n"
+                f"Answer:"
+            )
             try:
-                resp = self.client.chat.completions.create(
+                resp2 = self.client.chat.completions.create(
                     model=LLM_MODEL,
-                    messages=messages,
-                    temperature=LLM_TEMPERATURE,
-                    max_tokens=LLM_MAX_TOKENS,
+                    messages=[{"role": "system", "content": anti_echo_system},
+                              {"role": "user", "content": anti_echo_user}],
+                    temperature=0.1, max_tokens=LLM_MAX_TOKENS,
                 )
-                raw_output = (resp.choices[0].message.content or "").strip()
-                answer = raw_output
-
-                # If model still outputs "Answer:" or "Reasoning:", extract the answer part
-                answer_match = re.search(r'\bAnswer:\s*(.+)', answer, re.IGNORECASE | re.DOTALL)
-                if answer_match:
-                    answer = answer_match.group(1).strip()
-                # Remove any reasoning artifacts
-                answer = re.sub(r'\s*Reasoning:.*$', '', answer, flags=re.DOTALL).strip()
-                # Take first paragraph if multi-paragraph
-                if '\n\n' in answer:
-                    answer = answer.split('\n\n')[0].strip()
-
-                # Apply answer cleaning pipeline
-                answer = self.clean_answer(answer, chunks)
-
-                if resp.usage:
-                    debug["actual_prompt_tokens"] = resp.usage.prompt_tokens
-                    debug["completion_tokens"] = resp.usage.completion_tokens
-                    self.logger.debug(f"[LLM] actual: {resp.usage.prompt_tokens} prompt + "
-                                      f"{resp.usage.completion_tokens} completion tokens")
-                self.logger.debug(f"[LLM] q_type={q_type}")
-                self.logger.debug(f"[LLM] raw_output=\n{raw_output}")
-                self.logger.debug(f"[LLM] parsed_answer=\n{answer}")
-                return answer, debug
+                retry_answer = self._parse_raw_answer(
+                    (resp2.choices[0].message.content or "").strip(), chunks)
+                if retry_answer and not self.is_echo(retry_answer, question) and not self.is_idk(retry_answer):
+                    self.logger.debug(f"[AntiEcho] retry succeeded: {retry_answer[:150]}")
+                    best = retry_answer
+                else:
+                    self.logger.debug(f"[AntiEcho] retry didn't help, keeping original")
             except Exception as e:
-                wait = min(2 ** (attempt + 1), 30)
-                self.logger.warning(f"[LLM] Error (attempt {attempt+1}/{max_retries}): {e} — retry in {wait}s")
-                time.sleep(wait)
+                self.logger.warning(f"[AntiEcho] retry failed: {e}")
 
-        self.logger.error("[LLM] All retries failed, returning fallback answer.")
-        return "Unable to generate answer.", debug
+        # Apply span snapping to force extractive answer
+        best = self.snap_to_evidence_span(best, chunks)
+
+        # Clean ref markers that snap may have re-introduced from raw chunk text
+        best = re.sub(r'\s*BIBREF\d+', '', best)
+        best = re.sub(r'(?:Section\s+)?SECREF\d+', '', best)
+        best = re.sub(r'(?:Table\s+)?TABREF\d+', 'the table', best)
+        best = re.sub(r'(?:Figure\s+)?FIGREF\d+', 'the figure', best)
+        best = re.sub(r'INLINEFORM\d+', '', best)
+        best = re.sub(r'DISPLAYFORM\d+', '', best)
+        best = re.sub(r'\(\s*,?\s*\)', '', best)
+        best = re.sub(r'(,\s*)+', ', ', best)
+        best = re.sub(r'§\s*', '', best)
+        best = best.strip()
+
+        debug["sc_candidates"] = len(candidates)
+        return best, debug
 
     def generate_fallback(self, title: str, question: str, chunks: list,
                           extra_chunks: list = None, extra_sentences: list = None) -> tuple:
         """Fallback generation with a more permissive prompt for IDK recovery."""
         system = (
-            "Answer the question using information from the text. "
-            "Give a short, direct answer using the exact words from the text. "
-            "Never say 'not mentioned' or 'I don't know'. Always give an answer."
+            "Answer the question using the text below. "
+            "Give a short, direct answer. Use the exact words from the text. "
+            "Never say 'not mentioned' or 'I don't know'. "
+            "NEVER start with 'Here are', 'Based on', or 'The answer is'. "
+            "Start directly with the answer content."
         )
-        evidence = chunks[:MAX_EVIDENCE_FOR_LLM]
-        ev_lines = [f"[{i}] {c.parent_text[:PARENT_MAX_CHARS]}" for i, c in enumerate(evidence, 1)]
-
-        # Add supplementary context for fallback too
-        supp_lines = []
-        seen_texts = {c.parent_text[:100] for c in evidence}
-        if extra_chunks:
-            for c in extra_chunks[:6]:
-                key = c.parent_text[:100]
-                if key not in seen_texts:
-                    seen_texts.add(key)
-                    supp_lines.append(c.parent_text[:PARENT_MAX_CHARS])
-        if extra_sentences:
-            for sent in extra_sentences:
-                key = sent[:100]
-                if key not in seen_texts:
-                    seen_texts.add(key)
-                    supp_lines.append(sent)
-
-        supp_block = ""
-        if supp_lines:
-            supp_block = "\n\nAdditional context:\n" + "\n".join(f"- {s}" for s in supp_lines[:8])
+        ev_lines, supp_block, _ = self._build_llm_context(
+            chunks, extra_chunks, extra_sentences)
 
         user = (
             f"Paper: {title}\n\n"
@@ -956,11 +1213,8 @@ class Generator:
                 model=LLM_MODEL, messages=messages,
                 temperature=0.3, max_tokens=LLM_MAX_TOKENS,
             )
-            answer = (resp.choices[0].message.content or "").strip()
-            answer_match = re.search(r'\bAnswer:\s*(.+)', answer, re.IGNORECASE | re.DOTALL)
-            if answer_match:
-                answer = answer_match.group(1).strip()
-            answer = self.clean_answer(answer, chunks)
+            answer = self._parse_raw_answer(
+                (resp.choices[0].message.content or "").strip(), chunks)
             self.logger.debug(f"[LLM-fallback] answer={answer}")
             return answer, {}
         except Exception as e:
@@ -980,6 +1234,27 @@ class Generator:
     def is_idk(cls, answer: str) -> bool:
         a = answer.lower()
         return any(p in a for p in cls._IDK_PATTERNS)
+
+    @staticmethod
+    def is_echo(answer: str, question: str) -> bool:
+        """Detect if the answer is just echoing/restating the question."""
+        if not answer or not question:
+            return False
+        # Normalize
+        a_words = set(w.lower() for w in re.findall(r'\b[a-zA-Z]{3,}\b', answer))
+        q_words = set(w.lower() for w in re.findall(r'\b[a-zA-Z]{3,}\b', question))
+        # Remove common stop words
+        stop = {'the', 'and', 'for', 'are', 'was', 'were', 'has', 'have', 'had',
+                'this', 'that', 'with', 'from', 'into', 'also', 'more', 'than',
+                'their', 'they', 'them', 'some', 'other', 'been', 'not', 'will'}
+        a_words -= stop
+        q_words -= stop
+        if not a_words or not q_words:
+            return False
+        overlap = len(a_words & q_words)
+        # Echo if >55% of answer words come from question
+        ratio = overlap / len(a_words)
+        return ratio > 0.55 and len(a_words) < 25
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1087,12 +1362,13 @@ class RAGPipeline:
         # List-type questions may need more evidence, but still conservative
         return 3 if any(k in q for k in list_kw) else DEFAULT_FINAL_K
 
-    def process_paper(self, entry: dict) -> QAResult:
+    def process_paper(self, entry: dict, paper_idx: int, total_papers: int) -> QAResult:
         title = entry["title"]
         full_text = entry["full_text"]
         question = entry["question"]
 
         self.logger.debug(f"\n{'='*70}")
+        self.logger.debug(f"Paper #{paper_idx}/{total_papers}")
         self.logger.debug(f"Paper: {title}")
         self.logger.debug(f"Question: {question}")
         self.logger.debug(f"Text length: {len(full_text):,} chars")
@@ -1146,12 +1422,13 @@ class RAGPipeline:
         self.logger.debug(f"[Retrieval] K={k}, got {len(retrieved)} chunks in {dt_retrieval:.2f}s")
 
         # Stage 6b: Build expanded LLM context (decoupled from evidence output)
-        # Evidence output stays as top-k for scoring; LLM gets extra context for better answers
         reranked_pool = retrieval_debug.get("reranked_pool", retrieved)
+
+        # Stage 6c: Keyword-matched sentences from full text (supplements retrieval)
         kw_sentences = extract_keyword_sentences(full_text, question, max_sentences=8)
         self.logger.debug(f"[LLM Context] reranked_pool={len(reranked_pool)}, kw_sentences={len(kw_sentences)}")
 
-        # Stage 7: LLM Generation with expanded context
+        # Stage 7: LLM Generation with self-consistency voting
         t0 = time.time()
         if self.enable_generation and self.generator is not None:
             answer, gen_debug = self.generator.generate(
@@ -1178,17 +1455,35 @@ class RAGPipeline:
             dt_llm = 0.0
             self.logger.debug("[LLM] generation disabled")
 
-        # Stage 8: Cleanup
+        # Stage 8: Sentence-level evidence refinement
+        # Decouple evidence output from chunk retrieval:
+        #   - LLM gets full parent_text chunks for context (above)
+        #   - Evidence output uses fine-grained sentence spans for ROUGE-L
+        t0_refine = time.time()
+        # K=1 by default: scoring formula is sum(ROUGE-L)/K, so a weak 2nd evidence kills score
+        # Only K=2 for list-type questions where multiple golden evidences are expected
+        refine_max_k = 2 if any(kw in question.lower() for kw in [
+            "what are the", "list", "what methods", "what techniques",
+            "what datasets", "what models", "what features",
+            "what two", "what three", "what types", "what baselines",
+        ]) else 1
+        evidence = self.retriever.refine_evidence(
+            question, reranked_pool, full_text,
+            max_k=refine_max_k, logger=self.logger,
+        )
+        dt_refine = time.time() - t0_refine
+
+        # Stage 9: Cleanup
         self.retriever.clear()
 
         total_time = time.time() - t_start
-        evidence = [c.text for c in retrieved]  # evidence output unchanged
 
         self.logger.debug(f"[Result] answer ({len(answer)} chars): {answer}")
-        self.logger.debug(f"[Result] evidence: {len(evidence)} chunks, sections={[c.section for c in retrieved]}")
+        self.logger.debug(f"[Result] evidence: {len(evidence)} refined spans")
         self.logger.debug(f"[Time] total={total_time:.1f}s "
                           f"(chunk={dt_chunk:.1f}s, index={dt_index:.1f}s, "
-                          f"hyde={dt_hyde:.1f}s, retrieval={dt_retrieval:.1f}s, llm={dt_llm:.1f}s)")
+                          f"hyde={dt_hyde:.1f}s, retrieval={dt_retrieval:.1f}s, "
+                          f"refine={dt_refine:.1f}s, llm={dt_llm:.1f}s)")
 
         return QAResult(title=title, answer=answer, evidence=evidence)
 
@@ -1198,10 +1493,10 @@ class RAGPipeline:
 
         pbar = tqdm(dataset, desc="Processing papers", unit="paper",
                     dynamic_ncols=True, file=sys.stdout)
-        for entry in pbar:
+        for paper_idx, entry in enumerate(pbar, start=1):
             short_title = entry["title"][:45] + "..." if len(entry["title"]) > 45 else entry["title"]
             pbar.set_postfix_str(short_title)
-            result = self.process_paper(entry)
+            result = self.process_paper(entry, paper_idx, len(dataset))
             results.append(result)
             ans_preview = result.answer[:100].replace("\n", " ")
             # self.logger.debug(f"  → {ans_preview}")
