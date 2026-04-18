@@ -553,28 +553,21 @@ class Retriever:
         seen_keys = set()
 
         def _clean_evidence_text(text):
-            """Strip section headers and reference markers from evidence spans."""
+            """Light-clean evidence spans. Preserve BIBREF/TABREF/INLINEFORM markers
+            because ~35% of golden evidences contain them — stripping hurts ROUGE-L."""
             # Remove section header prefixes like "Abstract\n", "Conclusions\n", "Datasets :::\n"
             text = re.sub(r'^(?:Abstract|Introduction|Conclusions?|Related Work|Discussion|'
                           r'Results?|Methods?|Experiments?|Background|Evaluation)\s*\n',
                           '', text, flags=re.IGNORECASE)
             # Remove "Section ::: Subsection\n" style headers
             text = re.sub(r'^[A-Z][^\n]{0,60}(?:\s*:::)+[^\n]*\n', '', text)
-            # Remove reference markers
-            text = re.sub(r'\s*BIBREF\d+', '', text)
-            text = re.sub(r'(?:Section\s+)?SECREF\d+', '', text)
-            text = re.sub(r'(?:Table\s+)?TABREF\d+', 'the table', text)
-            text = re.sub(r'(?:Figure\s+)?FIGREF\d+', 'the figure', text)
-            text = re.sub(r'INLINEFORM\d+', '', text)
-            text = re.sub(r'DISPLAYFORM\d+', '', text)
-            text = re.sub(r'\(\s*,?\s*\)', '', text)
-            text = re.sub(r'(,\s*)+', ', ', text)
-            text = re.sub(r'§\s*', '', text)
+            # NOTE: Do NOT strip BIBREF/TABREF/FIGREF/INLINEFORM/DISPLAYFORM here —
+            # golden evidence often contains them (verified: 35% of golden has BIBREF).
             return text.strip()
 
         def _add(text):
             text = _clean_evidence_text(text)
-            if len(text) < 15 or len(text) > 700:
+            if len(text) < 15 or len(text) > 800:
                 return
             key = text[:60].lower()
             if key not in seen_keys:
@@ -582,7 +575,7 @@ class Retriever:
                 candidates.append(text)
 
         # Source 1: Sentences + sliding windows from top reranked chunks' parent text
-        for chunk in reranked_pool[:15]:  # CHANGED: was 8, deeper search
+        for chunk in reranked_pool[:20]:  # CHANGED: was 15 → 20, deeper pool
             # Also add the raw child chunk text as a candidate
             _add(chunk.text)
             try:
@@ -612,16 +605,21 @@ class Retriever:
                                             'have', 'has', 'had', 'for', 'with', 'from',
                                             'they', 'their', 'there', 'used', 'using',
                                             'paper'})
+        # Adaptive threshold: with few keywords, single match is enough; otherwise require 2
+        kw_threshold = 1 if len(q_keywords) <= 3 else 2
         for i, sent in enumerate(all_sents):
             if len(sent) < 20 or len(sent) > 500:
                 continue
             sent_lower = sent.lower()
             hit_count = sum(1 for kw in q_keywords if kw in sent_lower)
-            if hit_count >= 2:  # at least 2 keyword matches
+            if hit_count >= kw_threshold:
                 _add(sent)
                 # 2-sentence window
                 if i + 1 < len(all_sents):
                     _add(sent.strip() + ' ' + all_sents[i + 1].strip())
+                # 3-sentence window for higher recall
+                if i + 2 < len(all_sents) and hit_count >= kw_threshold:
+                    _add(' '.join(s.strip() for s in all_sents[i:i + 3]))
 
         # Source 3: Keyword-matched sentences (legacy, may overlap with source 2 — dedup handles it)
         kw_sents = extract_keyword_sentences(full_text, question, max_sentences=20)
@@ -863,8 +861,14 @@ class Generator:
                         best_score = f1
                         best_span = span
 
-        # Snap if reasonable match — threshold balances extractive fidelity vs wrong snaps
+        # Snap if reasonable match — threshold balances extractive fidelity vs wrong snaps.
+        # Guard: don't snap to a span that's much shorter than the answer unless score is
+        # very high (otherwise we collapse "KAR is an end-to-end MRC model" into bare "KAR").
         if best_score >= 0.4 and best_span:
+            orig_len = len(answer)
+            span_len = len(best_span)
+            if span_len < 0.5 * orig_len and best_score < 0.7:
+                return yesno_prefix + answer if yesno_prefix else answer
             return yesno_prefix + best_span if yesno_prefix else best_span
         return yesno_prefix + answer if yesno_prefix else answer
 
@@ -904,11 +908,17 @@ class Generator:
         )
         answer = re.sub(r"\bPassage[s]?\s*\[\d+\](\s*(and|,)\s*\[\d+\])*\s*", "", answer)
         # 3. IDK fallback — replace with first sentence of top chunk
+        # Strip "None." / "N/A" bare prefixes first (LLM sometimes emits literal "None.")
+        answer = re.sub(r'^(None|N/A|NA|No answer|No\.)\s*[.\-:]?\s*', '', answer, flags=re.IGNORECASE)
         idk_patterns = [
             r"none of the .*(passage|evidence)",
+            r"^none\s*[.\-:]",
             r"not (explicitly|specifically|directly) mentioned",
             r"does(n'?t| not) (mention|contain|include|provide|say|have)",
-            r"no (information|mention|evidence|specific)",
+            r"no (information|mention|evidence|specific|direct)",
+            r"not (answered|specified) (in|by)",
+            r"is not answered",
+            r"no (direct|explicit) (mention|answer)",
             r"unable to (find|determine|answer)",
             r"cannot (find|determine|answer)",
             r"not (enough|sufficient)",
@@ -1228,6 +1238,9 @@ class Generator:
         "no information", "unable to", "cannot find", "not enough",
         "not specifically", "not directly", "no specific",
         "doesn't provide", "does not provide", "not provided",
+        "no direct mention", "no direct answer", "is not answered",
+        "not answered in", "no explicit", "not specified in",
+        "evidence does not", "evidence doesn't",
     ]
 
     @classmethod
@@ -1436,19 +1449,34 @@ class RAGPipeline:
                 extra_chunks=reranked_pool[len(retrieved):],
                 extra_sentences=kw_sentences,
             )
-            # Stage 7b: IDK Recovery — retry with permissive prompt if answer is uncertain
-            if Generator.is_idk(answer):
-                self.logger.debug(f"[IDK Recovery] Detected IDK answer, retrying with fallback prompt")
+            # Stage 7b: IDK / empty / terse Recovery
+            # Treat these as degenerate and retry with permissive prompt:
+            #   - IDK phrasing
+            #   - Empty after cleaning
+            #   - Very short fragment with no verb (e.g., "English.", "GPT", "KAR")
+            def _needs_recovery(a: str) -> bool:
+                if not a or not a.strip():
+                    return True
+                if Generator.is_idk(a):
+                    return True
+                stripped = a.strip().rstrip('.').strip()
+                if len(stripped) < 12 and not re.search(r'\d', stripped):
+                    # Too short to be a semantic answer unless it contains a number.
+                    return True
+                return False
+
+            if _needs_recovery(answer):
+                self.logger.debug(f"[Recovery] Detected weak answer ({answer!r}), retrying with fallback prompt")
                 retry_answer, _ = self.generator.generate_fallback(
                     title, question, retrieved,
                     extra_chunks=reranked_pool[len(retrieved):],
                     extra_sentences=kw_sentences,
                 )
-                if retry_answer and not Generator.is_idk(retry_answer):
+                if retry_answer and not Generator.is_idk(retry_answer) and retry_answer.strip():
                     answer = retry_answer
-                    self.logger.debug(f"[IDK Recovery] Recovered: {answer[:100]}")
+                    self.logger.debug(f"[Recovery] Recovered: {answer[:100]}")
                 else:
-                    self.logger.debug(f"[IDK Recovery] Fallback also failed, keeping original")
+                    self.logger.debug(f"[Recovery] Fallback also failed, keeping original")
             dt_llm = time.time() - t0
         else:
             answer, gen_debug = "", {}
