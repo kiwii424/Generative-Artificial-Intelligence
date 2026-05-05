@@ -4,14 +4,18 @@
 # 切到 HW2 目錄
 cd /Users/meredithhuang/Desktop/code/Python/GAI/HW2
 
+# 建議使用 Python 3.11 重建環境
+uv python install 3.11
+uv sync --python 3.11
+
 # ① 先在 public dataset 測試（會顯示 ROUGE-L 分數）
-uv run python 111511157.py --eval --output public.json
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false uv run python 111511157.py --eval --output public.json
 
 # ② 跑完後用官方腳本驗證（需要先啟動 vLLM server）
 uv run python score_public.py public.json --port 8091 --host 192.168.0.7
 
 # ③ 最終提交：跑 private dataset
-uv run python 111511157.py
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false uv run python 111511157.py
 ```
 
 `--eval` 模式會印出每個階段的詳細資訊：

@@ -4,14 +4,15 @@ HW2 RAG — Self-Scoring Script (Public Dataset)
 Compare your pipeline output against the public dataset ground truth.
 
   Evidence Score  — ROUGE-L F-measure (identical algorithm to TA grading)
-  Correctness     — Lightweight LLM judge using the same 3B model you run for RAG
+  Correctness     — Lightweight LLM judge using the configured API model
                     ⚠ This is an approximation: TA grading uses a separate, more
                     capable model with a different evaluation procedure.
 
 Usage:
   python score_public.py results.json
-  python score_public.py results.json --port 8091
-  python score_public.py results.json --port 8091 --host 192.168.0.7
+  python score_public.py outputs/public.json
+  python score_public.py outputs/public.json --model meta-llama/llama-3.2-3b-instruct:free
+  python score_public.py outputs/public.json --base-url http://localhost:8091/v1 --api-key abc
 
 Input JSON format (same as submission):
   [{"title": "...", "answer": "...", "evidence": [...]}, ...]
@@ -23,28 +24,73 @@ Output:
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-from langchain_community.llms.vllm import VLLMOpenAI
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import PromptTemplate
+from dotenv import load_dotenv
+from openai import OpenAI
 from rouge_score import rouge_scorer
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+load_dotenv(SCRIPT_DIR / ".env")
+load_dotenv()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Self-score HW2 results on the public dataset")
-parser.add_argument("results",  type=str,                                        help="Path to your results JSON.")
-parser.add_argument("--host",   type=str, default="localhost",                   help="LLM server host. Default: localhost")
-parser.add_argument("--port",   type=int, default=8091,                          help="LLM API port (same server used for RAG). Default: 8091")
-parser.add_argument("--model",  type=str, default="meta-llama/Llama-3.2-3B-Instruct", help="LLM model name.")
-parser.add_argument("--dataset",type=str, default="public_dataset.json",help="Path to the public dataset JSON.")
-parser.add_argument("--times",  type=int, default=5,                             help="Judge runs per paper (majority vote). Default: 5")
+parser.add_argument("results",      type=str,                                        help="Path to your results JSON.")
+parser.add_argument("--provider",   type=str, default=os.getenv("LLM_PROVIDER", "openrouter"), help="LLM provider: openrouter, ollama, or custom. Default: openrouter")
+parser.add_argument("--base-url",   type=str, default=None,                          help="OpenAI-compatible API base URL. Default: provider/env setting")
+parser.add_argument("--api-key",    type=str, default=None,                          help="API key. Default: LLM_API_KEY or OPENROUTER_API_KEY from .env")
+parser.add_argument("--host",       type=str, default=None,                          help="Backward-compatible local API host; builds http://HOST:PORT/v1")
+parser.add_argument("--port",       type=int, default=None,                          help="Backward-compatible local API port; builds http://HOST:PORT/v1")
+parser.add_argument("--model",      type=str, default=None,                          help="LLM model name. Default: LLM_MODEL or provider default")
+parser.add_argument("--dataset",    type=str, default="datasets/public_dataset.json",help="Path to the public dataset JSON.")
+parser.add_argument("--times",      type=int, default=5,                             help="Judge runs per paper (majority vote). Default: 5")
+parser.add_argument("--temperature",type=float, default=0.0,                          help="Judge temperature. Default: 0.0")
 args = parser.parse_args()
 
-LLM_ENDPOINT = f"http://{args.host}:{args.port}/v1"
+LLM_PROVIDER = args.provider.strip().lower()
+if LLM_PROVIDER not in {"openrouter", "ollama", "custom"}:
+  sys.exit("--provider must be one of: openrouter, ollama, custom")
+
+def _default_base_url(provider: str) -> str:
+  if args.host or args.port:
+    return f"http://{args.host or 'localhost'}:{args.port or 8091}/v1"
+  if args.base_url:
+    return args.base_url
+  if os.getenv("LLM_BASE_URL"):
+    return os.environ["LLM_BASE_URL"]
+  if provider == "ollama":
+    return "http://127.0.0.1:11434/v1"
+  if provider == "custom":
+    sys.exit("--provider custom requires --base-url or LLM_BASE_URL.")
+  return "https://openrouter.ai/api/v1"
+
+def _default_model(provider: str) -> str:
+  if args.model:
+    return args.model
+  if os.getenv("LLM_MODEL"):
+    return os.environ["LLM_MODEL"]
+  if provider == "ollama":
+    return "llama3.2:3b"
+  return "meta-llama/llama-3.2-3b-instruct:free"
+
+def _looks_local_api(base_url: str) -> bool:
+  return any(host in base_url for host in ("localhost", "127.0.0.1", "0.0.0.0"))
+
+LLM_BASE_URL = _default_base_url(LLM_PROVIDER)
+LLM_MODEL = _default_model(LLM_PROVIDER)
+LLM_API_KEY = args.api_key or os.getenv("LLM_API_KEY")
+if not LLM_API_KEY and LLM_PROVIDER == "openrouter":
+  LLM_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not LLM_API_KEY and (LLM_PROVIDER == "ollama" or _looks_local_api(LLM_BASE_URL)):
+  LLM_API_KEY = "ollama"
+if not LLM_API_KEY:
+  sys.exit("API key not found. Set LLM_API_KEY or OPENROUTER_API_KEY in .env, or pass --api-key.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Evidence Score — ROUGE-L (identical to TA grading)
@@ -78,28 +124,28 @@ g) If the Ground Truth lists multiple items, score = 1 only if the Prediction co
 h) Otherwise, score = 0.
 
 IMPORTANT: The score MUST be exactly 0 or 1. No other value is valid.
+Return only the single digit 0 or 1.
 """
-_JUDGE_TEMPLATE = (
-  f"system: {_PROMPT_JUDGEMENT}\n"
-  "human:\n"
-  "document: {document}\n"
-  "question: {question}\n"
-  "Ground Truth: {answer}\n"
-  "Prediction: {prediction}\n"
-  "assistant: The score is "
-)
+_client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 
-_llm = VLLMOpenAI(
-  base_url=LLM_ENDPOINT,
-  api_key="abc",
-  model=args.model,
-  temperature=0.6,
-  max_tokens=1,
-  frequency_penalty=1.6, 
-  presence_penalty=0.8,
-  model_kwargs={"stop": ["```", "}}"]},
-)
-_judge_chain = PromptTemplate.from_template(_JUDGE_TEMPLATE) | _llm | StrOutputParser()
+def _run_judge(query: dict[str, str]) -> str:
+  user_prompt = (
+    f"document: {query['document']}\n"
+    f"question: {query['question']}\n"
+    f"Ground Truth: {query['answer']}\n"
+    f"Prediction: {query['prediction']}\n\n"
+    "Score:"
+  )
+  resp = _client.chat.completions.create(
+    model=LLM_MODEL,
+    messages=[
+      {"role": "system", "content": _PROMPT_JUDGEMENT},
+      {"role": "user", "content": user_prompt},
+    ],
+    temperature=args.temperature,
+    max_tokens=4,
+  )
+  return (resp.choices[0].message.content or "").strip()
 
 _IDK_RE = re.compile(
   r"i (don'?t|do not|cannot|can'?t) know"
@@ -110,11 +156,14 @@ _IDK_RE = re.compile(
 )
 
 def _extract_score(text: str) -> float:
-  """Extract 'The score is X' from judge output. Fallback: final standalone digit."""
-  m = re.search(r"The score is ([01])(?!\d)", text)
+  """Extract the judge's 0/1 answer from short API output."""
+  m = re.search(r"The score is ([01])(?!\d)", text, re.IGNORECASE)
   if m:
     return float(m.group(1))
   m = re.search(r"([01])\s*$", text.strip())
+  if m:
+    return float(m.group(1))
+  m = re.search(r"\b([01])\b", text)
   return float(m.group(1)) if m else 0.0
 
 def judge_correctness(
@@ -139,7 +188,7 @@ def judge_correctness(
   scores: list[float] = []
   for _ in range(times):
     try:
-      raw = _judge_chain.invoke(query)
+      raw = _run_judge(query)
       scores.append(_extract_score(raw))
     except Exception as exc:
       print(f"  [judge error: {exc}]", file=sys.stderr)
@@ -147,26 +196,37 @@ def judge_correctness(
     return 0.0
   return 1.0 if sum(scores) / len(scores) >= 0.5 else 0.0
 
+def _resolve_path(path: str) -> Path:
+  p = Path(path)
+  if p.is_absolute() or p.exists():
+    return p
+  script_relative = SCRIPT_DIR / p
+  return script_relative if script_relative.exists() else p
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Load data
 # ──────────────────────────────────────────────────────────────────────────────
-try:
-  with open(args.dataset) as f:
-    gt_map = {item["title"]: item for item in json.load(f)}
-except FileNotFoundError:
-  sys.exit(f"Dataset not found: {args.dataset}")
+dataset_path = _resolve_path(args.dataset)
+results_path = _resolve_path(args.results)
 
 try:
-  with open(args.results) as f:
+  with open(dataset_path, encoding="utf-8") as f:
+    gt_map = {item["title"]: item for item in json.load(f)}
+except FileNotFoundError:
+  sys.exit(f"Dataset not found: {dataset_path}")
+
+try:
+  with open(results_path, encoding="utf-8") as f:
     results = json.load(f)
 except FileNotFoundError:
-  sys.exit(f"Results file not found: {args.results}")
+  sys.exit(f"Results file not found: {results_path}")
 except json.JSONDecodeError as e:
-  sys.exit(f"Failed to parse {args.results}: {e}")
+  sys.exit(f"Failed to parse {results_path}: {e}")
 
 if not isinstance(results, list):
   sys.exit("Results JSON must be a list of objects.")
 
+print(f"Judge API: provider={LLM_PROVIDER}  model={LLM_MODEL}  base_url={LLM_BASE_URL}")
 print(f"Scoring {len(results)} entries against {len(gt_map)} papers in public dataset.\n")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -176,7 +236,6 @@ per_paper: list[dict] = []
 evid_total = corr_total = 0.0
 
 for idx, item in enumerate(results, 1):
-  print(f"[{idx:>3}] Scoring paper...", end=" ")
   title    = item.get("title", "")
   answer   = item.get("answer", "")
   evidence = item.get("evidence", [])
@@ -218,7 +277,7 @@ avg_corr = corr_total / n
 print(f"\n{'─'*60}")
 print(f"  Papers scored  : {n} / {len(results)}")
 print(f"  Evidence Score : {avg_evid:.5f}   (ROUGE-L, same as TA)")
-print(f"  Correctness    : {avg_corr:.5f}   (3B judge, approximate)")
+print(f"  Correctness    : {avg_corr:.5f}   (LLM judge, approximate)")
 print(f"{'─'*60}")
 print(
   "  ⚠  Correctness is an approximation.\n"
@@ -229,7 +288,7 @@ print(
 # ──────────────────────────────────────────────────────────────────────────────
 # Save
 # ──────────────────────────────────────────────────────────────────────────────
-out_path = str(Path(args.results).with_suffix("")) + "_score.json"
+out_path = str(results_path.with_suffix("")) + "_score.json"
 with open(out_path, "w", encoding="utf-8") as f:
   json.dump({
     "summary": {

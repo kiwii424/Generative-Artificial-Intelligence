@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>RAG Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #0ea5e9;
+      --evidence: #0f766e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--text);
+      margin: 0; padding: 24px; line-height: 1.5;
+    }
+    .container { max-width: 1000px; margin: 0 auto; }
+    h1 { margin: 0 0 4px 0; font-size: 1.6rem; }
+    .subtitle { color: var(--muted); margin-bottom: 20px; font-size: 0.9rem; }
+    .badge {
+      display: inline-block; background: #312e81; color: #c7d2fe;
+      padding: 2px 8px; border-radius: 999px; font-size: 0.75rem;
+      margin-left: 6px;
+    }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 8px; padding: 20px; margin-bottom: 16px;
+    }
+    label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 0.9rem; }
+    textarea {
+      width: 100%; background: #0f172a; color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+      font-family: inherit; font-size: 0.9rem; resize: vertical;
+    }
+    textarea:focus { outline: none; border-color: var(--accent); }
+    button {
+      background: var(--accent); color: #0f172a; border: none;
+      padding: 10px 20px; border-radius: 6px; font-weight: 600;
+      cursor: pointer; font-size: 0.95rem; margin-top: 12px;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { background: var(--muted); cursor: not-allowed; }
+    .answer-box {
+      background: #052e2b; border-left: 4px solid var(--evidence);
+      padding: 14px; border-radius: 6px; white-space: pre-wrap;
+    }
+    .evidence-item {
+      background: #0f172a; border: 1px solid var(--border);
+      border-radius: 6px; padding: 12px; margin-bottom: 10px;
+      white-space: pre-wrap; font-size: 0.9rem;
+    }
+    .evidence-idx {
+      color: var(--muted); font-size: 0.75rem; margin-bottom: 4px;
+    }
+    details { margin-top: 8px; }
+    details summary {
+      cursor: pointer; color: var(--accent); font-size: 0.9rem; user-select: none;
+    }
+    pre {
+      background: #0f172a; border: 1px solid var(--border);
+      border-radius: 6px; padding: 12px; overflow-x: auto;
+      font-size: 0.78rem; margin-top: 8px; white-space: pre-wrap;
+    }
+    .error {
+      background: #450a0a; border-left: 4px solid #ef4444;
+      padding: 12px; border-radius: 6px; color: #fecaca;
+    }
+    .spinner { color: var(--muted); font-style: italic; }
+    .hint { color: var(--muted); font-size: 0.8rem; margin-top: 4px; }
+    .kv { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.8rem; color: var(--muted); }
+    .kv span b { color: var(--text); font-weight: 600; }
+    .stream-log {
+      background: #0f172a; border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 0.78rem; max-height: 480px; overflow-y: auto;
+    }
+    .log-line {
+      padding: 3px 0; border-bottom: 1px dashed #1e293b;
+      display: flex; gap: 8px; align-items: baseline;
+    }
+    .log-line:last-child { border-bottom: none; }
+    .log-tag {
+      flex-shrink: 0; width: 78px;
+      font-size: 0.68rem; text-transform: uppercase;
+      letter-spacing: 0.05em; font-weight: 700;
+    }
+    .log-msg { color: var(--text); word-break: break-word; }
+    .tag-chunk     { color: #fbbf24; }
+    .tag-index     { color: #eab308; }
+    .tag-route     { color: #c084fc; }
+    .tag-variants  { color: #a78bfa; }
+    .tag-hyde      { color: #f472b6; }
+    .tag-retrieval { color: #38bdf8; }
+    .tag-rerank    { color: #22d3ee; }
+    .tag-refine    { color: #2dd4bf; }
+    .tag-dynk      { color: #34d399; }
+    .tag-llm       { color: #60a5fa; }
+    .tag-recovery  { color: #fb923c; }
+    .tag-fallback  { color: #fb923c; }
+    .tag-result    { color: #4ade80; }
+    .tag-time      { color: #94a3b8; }
+    .tag-header    { color: #f1f5f9; font-weight: 700; }
+    .tag-detail    { color: #64748b; }
+    .tag-info      { color: #94a3b8; }
+    .tag-start     { color: #94a3b8; }
+    .running-dot {
+      display: inline-block; width: 8px; height: 8px;
+      background: var(--accent); border-radius: 50%;
+      animation: pulse 1s infinite;
+      margin-right: 6px;
+    }
+    @keyframes pulse { 0%,100% {opacity: 0.3;} 50% {opacity: 1;} }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>RAG Demo <span class="badge" id="modelBadge"></span></h1>
+    <div class="subtitle">Section-aware chunking · Dense+BM25+RRF · BGE reranker · HyDE · sentence-level evidence refine</div>
+
+    <div class="card">
+      <label for="title">Paper title (optional)</label>
+      <!-- <textarea id="title" rows="1" placeholder="Paper title (optional)..."></textarea> -->
+      <textarea id="title" rows="1" ></textarea>
+
+      <div style="margin-top: 14px;">
+        <label for="paper">Paper full text</label>
+        <textarea id="paper" rows="12" placeholder="Paste the paper's full text (abstract + body)..."></textarea>
+        <div class="hint">Section headers on their own line (Abstract / Introduction / Methodology / Results / Conclusion) help the router target the right chunks.</div>
+      </div>
+
+      <div style="margin-top: 14px;">
+        <label for="question">Question</label>
+        <textarea id="question" rows="2" placeholder="e.g. What dataset did the authors use?"></textarea>
+      </div>
+
+      <button id="askBtn" onclick="ask()">Ask</button>
+      <span id="timing" class="hint" style="margin-left: 12px;"></span>
+    </div>
+
+    <div id="result"></div>
+  </div>
+
+  <script>
+    async function loadHealth() {
+      try {
+        const r = await fetch("/health");
+        const d = await r.json();
+        document.getElementById("modelBadge").textContent =
+          d.ready ? d.llm_model.split("/").pop() : "loading models...";
+      } catch {}
+    }
+    loadHealth();
+
+    async function ask() {
+      const paper = document.getElementById("paper").value.trim();
+      const question = document.getElementById("question").value.trim();
+      const title = document.getElementById("title").value.trim() || "Demo paper";
+      const resultEl = document.getElementById("result");
+      const btn = document.getElementById("askBtn");
+      const timingEl = document.getElementById("timing");
+
+      if (paper.length < 50) { resultEl.innerHTML = '<div class="card error">Paper text too short (≥ 50 chars).</div>'; return; }
+      if (question.length < 3) { resultEl.innerHTML = '<div class="card error">Please enter a question.</div>'; return; }
+
+      btn.disabled = true;
+      timingEl.textContent = "";
+      resultEl.innerHTML = `
+        <div class="card">
+          <label><span class="running-dot"></span>Live pipeline</label>
+          <div id="streamLog" class="stream-log"></div>
+        </div>`;
+      const logEl = document.getElementById("streamLog");
+      appendLog(logEl, "start", "starting pipeline…");
+      const t0 = performance.now();
+
+      try {
+        const res = await fetch("/query/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ paper_text: paper, question, title })
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }));
+          throw new Error(err.detail || "Request failed");
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let finalData = null;
+        let errMsg = null;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let sep;
+          while ((sep = buf.indexOf("\n\n")) !== -1) {
+            const raw = buf.slice(0, sep);
+            buf = buf.slice(sep + 2);
+            if (!raw.startsWith("data:")) continue;
+            const payload = raw.slice(5).trim();
+            if (!payload) continue;
+            let evt;
+            try { evt = JSON.parse(payload); } catch { continue; }
+            if (evt.type === "log") {
+              appendLog(logEl, evt.tag, evt.msg);
+            } else if (evt.type === "result") {
+              finalData = evt;
+            } else if (evt.type === "error") {
+              errMsg = evt.msg;
+            }
+          }
+        }
+
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+        timingEl.textContent = errMsg ? `failed after ${elapsed}s` : `done in ${elapsed}s (server: ${finalData?.total_sec}s)`;
+
+        if (errMsg) {
+          resultEl.insertAdjacentHTML("beforeend", `<div class="card error">${escapeHtml(errMsg)}</div>`);
+        } else if (finalData) {
+          renderResult(finalData);
+        }
+      } catch (e) {
+        resultEl.insertAdjacentHTML("beforeend", `<div class="card error">${escapeHtml(e.message)}</div>`);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function appendLog(el, tag, msg) {
+      const div = document.createElement("div");
+      div.className = "log-line";
+      div.innerHTML = `<span class="log-tag tag-${tag}">${tag}</span><span class="log-msg">${escapeHtml(msg)}</span>`;
+      el.appendChild(div);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function renderResult(data) {
+      const evidence = data.evidence.map((e, i) => `
+        <div class="evidence-item">
+          <div class="evidence-idx">Evidence #${i + 1} · ${e.length} chars</div>
+          <div>${escapeHtml(e)}</div>
+        </div>`).join("");
+
+      const cfg = data.config;
+      const cfgLine = `
+        <div class="kv">
+          <span>LLM: <b>${escapeHtml(cfg.llm)}</b></span>
+          <span>Embed: <b>${escapeHtml(cfg.embed.split("/").pop())}</b></span>
+          <span>Reranker: <b>${escapeHtml(cfg.reranker.split("/").pop())}</b></span>
+          <span>Total: <b>${data.total_sec}s</b></span>
+        </div>`;
+
+      const html = `
+        <div class="card">
+          <label>Answer</label>
+          <div class="answer-box">${escapeHtml(data.answer)}</div>
+          ${cfgLine}
+        </div>
+        <div class="card">
+          <label>Retrieved Evidence (${data.evidence.length})</label>
+          ${evidence || '<div class="hint">No evidence returned.</div>'}
+        </div>`;
+      document.getElementById("result").insertAdjacentHTML("beforeend", html);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+.DS_Store
+CLAUDE.md
+.claude 
+.env
+# Large local artifacts
+*.zip
+*.safetensors
+adapter_checkpoint/
+data_cache/

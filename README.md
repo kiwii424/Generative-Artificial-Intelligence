@@ -5,8 +5,8 @@ Instructor: 帥宏翰
 
 | Project      | Problem                         | What I built                                                                                             | Outcome                                                                          |
 | ------------ | ------------------------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| [HW1](./HW1) | Pathology multiple-choice QA    | 以`unsloth/Llama-3.2-1B-Instruct` 做 4-bit LoRA 微調，加入資料增強、hard example mining 與兩階段再訓練   |  hold-out accuracy**74.86%**                                                    |
-| [HW2](./HW2) | Document QA over 200 NLP papers | 建立完整 RAG pipeline：parent-child chunking、FAISS + BM25 混合檢索、HyDE、RRF、reranker、LLM generation | 保存的公開測試版本顯示 evidence score 最高到**0.2798**；另有系統化 ablation 實驗 |
+| [HW1](./HW1) | Pathology multiple-choice QA    | 以`unsloth/Llama-3.2-1B-Instruct` 做 4-bit LoRA 微調，加入資料增強、hard example mining 與兩階段再訓練   | hold-out accuracy** 74.86%**                                                    |
+| [HW2](./HW2) | Document QA over 200 NLP papers | 建立完整 RAG pipeline：parent-child chunking、FAISS + BM25 混合檢索、HyDE、RRF、reranker、LLM generation | 保存的公開測試版本顯示 evidence score 最高到**0.3528**；另有系統化 ablation 實驗 |
 
 ## Why This Repo Is Worth Reading
 

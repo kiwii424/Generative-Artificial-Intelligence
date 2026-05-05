@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GenAI Research QA Agent</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #0ea5e9;
+      --evidence: #0f766e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 960px; margin: 0 auto; }
+    h1 { margin: 0 0 4px 0; font-size: 1.6rem; }
+    .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 0.9rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 0.9rem; }
+    textarea, input[type=number] {
+      width: 100%;
+      background: #0f172a;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      font-family: inherit;
+      font-size: 0.9rem;
+      resize: vertical;
+    }
+    textarea:focus, input:focus { outline: none; border-color: var(--accent); }
+    .row { display: flex; gap: 12px; align-items: flex-end; margin-top: 12px; }
+    .row > div:first-child { flex: 1; }
+    button {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 0.95rem;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { background: var(--muted); cursor: not-allowed; }
+    .answer-box {
+      background: #052e2b;
+      border-left: 4px solid var(--evidence);
+      padding: 14px;
+      border-radius: 6px;
+      white-space: pre-wrap;
+    }
+    .evidence-item {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+    .evidence-header {
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-bottom: 6px;
+    }
+    .score-badge {
+      background: var(--evidence);
+      color: white;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+    }
+    details { margin-top: 12px; }
+    details summary {
+      cursor: pointer;
+      color: var(--accent);
+      font-size: 0.9rem;
+      user-select: none;
+    }
+    pre {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      overflow-x: auto;
+      font-size: 0.8rem;
+      margin-top: 8px;
+    }
+    .error {
+      background: #450a0a;
+      border-left: 4px solid #ef4444;
+      padding: 12px;
+      border-radius: 6px;
+      color: #fecaca;
+    }
+    .spinner { color: var(--muted); font-style: italic; }
+    .hint { color: var(--muted); font-size: 0.8rem; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>GenAI Research QA Agent</h1>
+    <div class="subtitle">Paste a research paper, ask a question, get an evidence-grounded answer.</div>
+
+    <div class="card">
+      <label for="paper">Paper text</label>
+      <textarea id="paper" rows="10" placeholder="Paste the full text of a research paper here..."></textarea>
+      <div class="hint">Plain text only. Paste the body / abstract / sections you care about.</div>
+
+      <div style="margin-top: 16px;">
+        <label for="question">Question</label>
+        <textarea id="question" rows="2" placeholder="e.g. What dataset did the authors use?"></textarea>
+      </div>
+
+      <div class="row">
+        <div>
+          <label for="topk">Top-K evidence</label>
+          <input type="number" id="topk" value="3" min="1" max="10" />
+        </div>
+        <button id="askBtn" onclick="ask()">Ask</button>
+      </div>
+    </div>
+
+    <div id="result"></div>
+  </div>
+
+  <script>
+    async function ask() {
+      const paper = document.getElementById("paper").value.trim();
+      const question = document.getElementById("question").value.trim();
+      const topk = parseInt(document.getElementById("topk").value, 10) || 3;
+      const resultEl = document.getElementById("result");
+      const btn = document.getElementById("askBtn");
+
+      if (paper.length < 50) { resultEl.innerHTML = '<div class="card error">Please paste a longer paper text (≥ 50 chars).</div>'; return; }
+      if (question.length < 3) { resultEl.innerHTML = '<div class="card error">Please enter a question.</div>'; return; }
+
+      btn.disabled = true;
+      resultEl.innerHTML = '<div class="card spinner">Retrieving evidence and generating answer...</div>';
+
+      try {
+        const res = await fetch("/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ paper_text: paper, question, top_k: topk })
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }));
+          throw new Error(err.detail || "Request failed");
+        }
+        const data = await res.json();
+        renderResult(data);
+      } catch (e) {
+        resultEl.innerHTML = `<div class="card error">${escapeHtml(e.message)}</div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function renderResult(data) {
+      const evidence = data.evidence.map(e => `
+        <div class="evidence-item">
+          <div class="evidence-header">
+            <span>Chunk #${e.chunk_id}</span>
+            <span class="score-badge">BM25 ${e.score}</span>
+          </div>
+          <div>${escapeHtml(e.text)}</div>
+        </div>`).join("");
+
+      document.getElementById("result").innerHTML = `
+        <div class="card">
+          <label>Answer</label>
+          <div class="answer-box">${escapeHtml(data.answer)}</div>
+        </div>
+        <div class="card">
+          <label>Retrieved Evidence (${data.evidence.length})</label>
+          ${evidence}
+        </div>
+        <div class="card">
+          <details>
+            <summary>Pipeline trace</summary>
+            <pre>${escapeHtml(JSON.stringify(data.trace, null, 2))}</pre>
+          </details>
+        </div>`;
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+  </script>
+</body>
+</html>
